@@ -6,6 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from api.config import settings
 from api.engine.base import Locator as EngineLocator
 from api.engine.base import LocatorOptions as EngineLocatorOptions
 
@@ -55,9 +56,9 @@ class Locator(BaseModel):
 class CreateSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    headless: bool = True
-    viewport_width: int = Field(default=1280, ge=1, le=7680)
-    viewport_height: int = Field(default=720, ge=1, le=4320)
+    headless: bool = Field(default_factory=lambda: settings.headless)
+    viewport_width: int = Field(default_factory=lambda: settings.default_viewport_width, ge=1, le=7680)
+    viewport_height: int = Field(default_factory=lambda: settings.default_viewport_height, ge=1, le=4320)
     user_agent: str | None = Field(default=None, max_length=2048)
     idle_timeout_seconds: int | None = Field(default=None, ge=1)
 

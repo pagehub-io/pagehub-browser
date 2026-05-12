@@ -65,7 +65,7 @@ def engine_error_http(exc: EngineError) -> HTTPException:
     if isinstance(exc, BlockedNavigation):
         return HTTPException(status_code=400, detail=str(exc))
     if isinstance(exc, NavigationError):
-        return HTTPException(status_code=502, detail=str(exc))
+        return HTTPException(status_code=502, detail=_sanitize(str(exc)))
     if isinstance(exc, RuntimeEvalError):
         return HTTPException(status_code=422, detail=f"Action failed: {_sanitize(exc.engine_message)}.")
     if isinstance(exc, EngineCrash):

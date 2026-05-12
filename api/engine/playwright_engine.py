@@ -91,9 +91,22 @@ class PlaywrightEngineSession(EngineSession):
         self._page = page
         self._console: deque[ConsoleLogEntry] = deque(maxlen=settings.max_log_entries)
         self._network: deque[NetworkLogEntry] = deque(maxlen=settings.max_log_entries)
+        self._last_blocked_nav: str | None = None
         page.on("console", self._on_console)
         page.on("request", self._on_request)
         page.on("response", self._on_response)
+
+    async def _navigation_interceptor(self, route: Route) -> None:
+        request = route.request
+        try:
+            if request.is_navigation_request() and navigation_request_is_blocked(request.url):
+                self._last_blocked_nav = request.url
+                await route.abort("aborted")
+                return
+            await route.continue_()
+        except PlaywrightError:
+            # Route already handled / page gone — nothing to do.
+            pass
 
     # ---- listeners ----
 
@@ -185,15 +198,16 @@ class PlaywrightEngineSession(EngineSession):
 
     # ---- navigate ----
 
-    async def navigate(self, url: str, wait_until: str) -> NavigateResult:
+    async def navigate(self, url: str, wait_until: str, timeout: int) -> NavigateResult:
+        self._last_blocked_nav = None
         try:
-            response = await self._page.goto(url, wait_until=wait_until)  # type: ignore[arg-type]
+            response = await self._page.goto(url, wait_until=wait_until, timeout=timeout)  # type: ignore[arg-type]
         except PlaywrightTimeoutError as exc:
             raise ActionTimeout(f"Timed out waiting for page to reach {wait_until}.") from exc
         except PlaywrightError as exc:
             msg = getattr(exc, "message", str(exc))
-            if "net::err_aborted" in msg.lower() and navigation_request_is_blocked(url):
-                raise BlockedNavigation(url) from exc
+            if self._last_blocked_nav is not None:
+                raise BlockedNavigation(self._last_blocked_nav) from exc
             if _is_dead_target_error(msg):
                 raise EngineCrash(msg) from exc
             raise NavigationError(url, msg) from exc
@@ -349,7 +363,7 @@ class PlaywrightEngineSession(EngineSession):
         for i in range(min(count, 50)):
             el = pw_loc.nth(i)
             try:
-                handle = await el.element_handle()
+                handle = await el.element_handle(timeout=5000)
                 if handle is None:
                     continue
                 tag = (await handle.evaluate("el => el.tagName.toLowerCase()")) or ""
@@ -527,22 +541,12 @@ class PlaywrightEngine(Engine):
             if opts.user_agent:
                 context_kwargs["user_agent"] = opts.user_agent
             context = await browser.new_context(**context_kwargs)
-            await context.route("**/*", self._navigation_interceptor)
             page = await context.new_page()
+            session = PlaywrightEngineSession(self, context, page)
+            await context.route("**/*", session._navigation_interceptor)
         except PlaywrightError as exc:
             raise EngineCrash(getattr(exc, "message", str(exc))) from exc
-        return PlaywrightEngineSession(self, context, page)
-
-    async def _navigation_interceptor(self, route: Route) -> None:
-        request = route.request
-        try:
-            if request.is_navigation_request() and navigation_request_is_blocked(request.url):
-                await route.abort()
-                return
-            await route.continue_()
-        except PlaywrightError:
-            # Route already handled / page gone — nothing to do.
-            pass
+        return session
 
     def is_alive(self) -> bool:
         return self._browser is not None and self._browser.is_connected()

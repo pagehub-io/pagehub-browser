@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Awaitable, Callable, TypeVar
 from urllib.parse import urlsplit
 
@@ -73,8 +74,6 @@ _ERROR_RESPONSES = {
 
 T = TypeVar("T")
 
-_BODILESS_TIMEOUT_MS = settings.action_timeout_max_ms
-
 
 async def _run_action(
     manager: SessionManager,
@@ -98,35 +97,42 @@ async def _run_action(
         raise session_busy_http(SessionBusy())
 
     manager.actions_total += 1
+    host_suffix = f" host={log_host}" if log_host else ""
+    started = time.monotonic()
     try:
         result = await fn(rec.engine_session, rec)
     except EngineError as exc:
-        # The caller is actively using the session even on a not-found 404 — bump the clock.
-        manager.touch(rec)
+        dur_ms = int((time.monotonic() - started) * 1000)
         http_exc = engine_error_http(exc)
+        # The idle clock bumps on success and on a locator-not-found 404 only — not on a
+        # 5xx engine crash, not on an unexpected fault.
+        if http_exc.status_code == 404:
+            manager.touch(rec)
         if is_5xx_engine_error(exc) or http_exc.status_code >= 500:
             manager.action_errors_total += 1
             logger.error("action sid=%s verb=%s engine error: %s", short(session_id), verb, exc)
         logger.info(
-            "action sid=%s verb=%s status=%s%s",
+            "action sid=%s verb=%s status=%s dur_ms=%d%s",
             short(session_id),
             verb,
             http_exc.status_code,
-            f" host={log_host}" if log_host else "",
+            dur_ms,
+            host_suffix,
         )
         raise http_exc
     except Exception:  # noqa: BLE001 - unexpected fault -> 500, no detail in body
-        manager.touch(rec)
+        dur_ms = int((time.monotonic() - started) * 1000)
         manager.action_errors_total += 1
         logger.exception("action sid=%s verb=%s unexpected fault", short(session_id), verb)
+        logger.info(
+            "action sid=%s verb=%s status=500 dur_ms=%d%s", short(session_id), verb, dur_ms, host_suffix
+        )
         raise HTTPException(status_code=500, detail="Internal error.")
     else:
+        dur_ms = int((time.monotonic() - started) * 1000)
         manager.touch(rec)
         logger.info(
-            "action sid=%s verb=%s status=200%s",
-            short(session_id),
-            verb,
-            f" host={log_host}" if log_host else "",
+            "action sid=%s verb=%s status=200 dur_ms=%d%s", short(session_id), verb, dur_ms, host_suffix
         )
         return result
     finally:
@@ -136,7 +142,7 @@ async def _run_action(
 # ---- navigate ------------------------------------------------------------------
 
 
-@router.post("/navigate", response_model=NavigateResponse, response_model_exclude_none=True, responses=_ERROR_RESPONSES)
+@router.post("/navigate", response_model=NavigateResponse, responses=_ERROR_RESPONSES)
 async def navigate(
     session_id: str, body: NavigateRequest, manager: SessionManager = Depends(get_manager)
 ) -> NavigateResponse:
@@ -149,7 +155,7 @@ async def navigate(
     host = urlsplit(body.url).hostname
 
     async def do(engine: EngineSession, rec: SessionRecord) -> NavigateResponse:
-        result = await engine.navigate(body.url, body.wait_until)
+        result = await engine.navigate(body.url, body.wait_until, body.timeout)
         rec.current_url = result.url
         return NavigateResponse(
             url=result.url, status=result.status, title=result.title, text=result.text

@@ -32,7 +32,7 @@ class FakeClock:
 class FakeEngineSession(EngineSession):
     def __init__(self) -> None:
         self.closed = False
-        self.navigate_calls: list[tuple[str, str]] = []
+        self.navigate_calls: list[tuple[str, str, int]] = []
         self._url: str | None = None
         self._console: list[ConsoleLogEntry] = [ConsoleLogEntry(type="log", text="fake-console")]
         self._network: list[NetworkLogEntry] = [
@@ -58,9 +58,9 @@ class FakeEngineSession(EngineSession):
         if exc is not None:
             raise exc
 
-    async def navigate(self, url: str, wait_until: str) -> NavigateResult:
+    async def navigate(self, url: str, wait_until: str, timeout: int) -> NavigateResult:
         await self._gate("navigate")
-        self.navigate_calls.append((url, wait_until))
+        self.navigate_calls.append((url, wait_until, timeout))
         self._url = url
         return NavigateResult(
             url=url,

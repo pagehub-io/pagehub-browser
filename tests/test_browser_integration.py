@@ -5,8 +5,6 @@ Run with `make test-browser` (CI installs Playwright + Chromium); skipped otherw
 
 from __future__ import annotations
 
-import importlib
-
 import pytest
 
 pytestmark = pytest.mark.browser
@@ -14,33 +12,28 @@ pytestmark = pytest.mark.browser
 
 @pytest.fixture
 def real_client(monkeypatch):
-    """A TestClient backed by the real PlaywrightEngine, with a fast reaper."""
-    monkeypatch.setenv("ENGINE", "playwright")
-    monkeypatch.setenv("GIT_COMMIT", "test-sha")
-    monkeypatch.setenv("REAPER_INTERVAL_SECONDS", "1")
-    monkeypatch.setenv("HEADLESS", "true")
+    """A TestClient backed by the real PlaywrightEngine, with a fast reaper.
 
-    import api.config
-
-    importlib.reload(api.config)
-    import api.main
-
-    importlib.reload(api.main)
+    No module reloads — those mutate the global `settings` / `api.main` modules and leak
+    into later tests. The engine is injected directly; the reaper cadence is shrunk via a
+    monkeypatched setting (auto-restored) so the lifespan builds the manager with it, and
+    the idle floor is dropped on the live manager after startup.
+    """
     from fastapi.testclient import TestClient
 
-    # patch the idle floor down so a session created with idle_timeout=1 can be reaped fast
+    from api.config import settings
+    from api.engine.playwright_engine import PlaywrightEngine
+    from api.main import create_app
 
-    app = api.main.create_app()
+    monkeypatch.setattr(settings, "reaper_interval_seconds", 1)
+
+    app = create_app()
+    app.state.engine = PlaywrightEngine()
     with TestClient(app) as c:
-        # shrink the min idle clamp on the live manager
         c.app.state.manager.idle_timeout_min = 1
         c.app.state.manager.idle_timeout_default = 1
+        c.app.state.manager.reaper_interval = 1
         yield c
-
-    # restore module state for the rest of the suite
-    monkeypatch.delenv("ENGINE", raising=False)
-    importlib.reload(api.config)
-    importlib.reload(api.main)
 
 
 def test_full_flow_real_browser(real_client):
@@ -120,6 +113,25 @@ def test_ssrf_redirect_interceptor(real_client):
     assert r.status_code in (400, 502)
     if r.status_code == 400:
         assert "host not allowed" in r.json()["detail"]
+    c.request("DELETE", f"/v1/sessions/{sid}")
+
+
+def test_evaluate_timeout_real(real_client):
+    """A never-resolving Promise must be killed by the asyncio.wait_for wrapper, not the 120s ceiling."""
+    import time
+
+    c = real_client
+    sid = c.post("/v1/sessions", json={"headless": True}).json()["session_id"]
+    c.post(f"/v1/sessions/{sid}/navigate", json={"url": "https://example.com"})
+    started = time.monotonic()
+    r = c.post(
+        f"/v1/sessions/{sid}/evaluate",
+        json={"expression": "new Promise(resolve => {})", "timeout": 1500},
+    )
+    elapsed = time.monotonic() - started
+    assert r.status_code == 409, r.text
+    assert "Timed out" in r.json()["detail"]
+    assert elapsed < 10
     c.request("DELETE", f"/v1/sessions/{sid}")
 
 
