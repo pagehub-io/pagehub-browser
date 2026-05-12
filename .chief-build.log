@@ -1,0 +1,8 @@
+2026-05-12T12:29:45 phase=1a round=0 drafted=spec-manager,spec-designer,spec-architect
+2026-05-12T12:32:21 phase=1b round=1 agree= disagree=spec-manager,spec-designer,spec-architect note=plus-user-locator-steering
+2026-05-12T12:43:29 phase=1b round=2 revised=spec-manager,spec-designer,spec-architect
+2026-05-12T12:45:30 phase=1b round=3 agree= disagree=spec-manager,spec-designer,spec-architect note=two-narrow-cross-section-string/status-reconciliations
+2026-05-12T12:47:38 phase=1b round=4 revised=spec-architect,spec-designer
+2026-05-12T12:49:16 phase=1b round=5 fix=architect-detail-strings-verbatim
+2026-05-12T12:51:13 phase=1b round=6 agree=spec-designer,spec-architect disagree=spec-manager note=micro-fix-tombstone-on-DELETE-then-converge
+2026-05-12T12:52:01 phase=1 DONE consensus=spec-manager,spec-designer,spec-architect
