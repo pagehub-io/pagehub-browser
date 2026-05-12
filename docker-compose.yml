@@ -1,0 +1,21 @@
+services:
+  pagehub-browser:
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-local-dev}
+    image: pagehub-browser:local
+    ports:
+      - "4010:4010"
+    env_file:
+      - .env
+    environment:
+      # .env keeps ENV=development for local dev; any deployed compose MUST override this.
+      ENV: ${ENV:-development}
+    # So `navigate` to http://host.docker.internal:<port>/ reaches a target frontend running
+    # on the host (paired with BROWSER_ALLOW_PRIVATE_HOSTS=true in .env — dev only).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Chromium needs more shared memory than the default 64MB; --disable-dev-shm-usage also covers us.
+    shm_size: "1gb"
+    restart: unless-stopped

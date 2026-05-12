@@ -1,0 +1,37 @@
+name: deploy
+
+# Tag-triggered Modal deploy. `v*` => production, `staging-*` => staging.
+# Only maintainers can push tags; GitHub does not pass secrets to fork PRs, so a fork
+# PR cannot deploy or read the Modal token even though it can see this file.
+on:
+  push:
+    tags:
+      - "v*"
+      - "staging-*"
+
+permissions:
+  contents: read
+
+jobs:
+  modal-deploy:
+    runs-on: ubuntu-latest
+    env:
+      # Gavin: set these as repo secrets (`gh secret set MODAL_TOKEN_ID -R pagehub-io/pagehub-browser`)
+      # or grant the org PAGEHUB_MODAL_TOKEN_* pair repository access and reference them here.
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # modal_app.py reads `git rev-parse --short HEAD` to bake GIT_COMMIT
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install modal
+      - name: modal deploy
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
+            echo "MODAL_TOKEN_ID / MODAL_TOKEN_SECRET not set — run 'modal deploy modal_app.py' manually." >&2
+            exit 1
+          fi
+          modal deploy modal_app.py
