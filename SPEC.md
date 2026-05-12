@@ -1,0 +1,7 @@
+# SPEC
+
+## Manager
+
+## Designer
+
+## Architect
