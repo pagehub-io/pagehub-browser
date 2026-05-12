@@ -49,7 +49,7 @@ def session_busy_http(exc: SessionBusy) -> HTTPException:
 
 
 def engine_error_http(exc: EngineError) -> HTTPException:
-    """Map an engine-typed error. Returns (HTTPException, is_5xx) — caller bumps action_errors_total on 5xx."""
+    """Map an engine-typed error to an HTTPException; the caller bumps action_errors_total on a 5xx."""
     if isinstance(exc, ElementNotFound):
         return HTTPException(status_code=404, detail=str(exc))
     if isinstance(exc, AttributeNotPresent):

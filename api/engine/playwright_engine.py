@@ -212,6 +212,11 @@ class PlaywrightEngineSession(EngineSession):
                 raise EngineCrash(msg) from exc
             raise NavigationError(url, msg) from exc
 
+        # Belt-and-suspenders: if the interceptor flagged a blocked navigation but route.abort()
+        # itself failed (swallowed), goto can still "succeed" with the blocked content — refuse it.
+        if self._last_blocked_nav is not None:
+            raise BlockedNavigation(self._last_blocked_nav)
+
         if response is None:
             try:
                 title = await self._page.title()
