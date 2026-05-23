@@ -74,6 +74,22 @@ build's short SHA — check it against `git rev-parse --short HEAD`).
 `sessions_rejected_total`, `actions_total`, `action_errors_total`,
 `browser_restarts_total`, `uptime_seconds`).
 
+### Admin (bearer-token gated)
+
+| Method & path | Body | Response |
+|---|---|---|
+| `POST /v1/admin/reset-sessions` | `{reason?: str}` (defaults to `"operator-initiated"`) | `200 {closed: int, reason: str}` |
+
+Send `Authorization: Bearer <ADMIN_AUTH_TOKEN>`. The token comes from the
+`ADMIN_AUTH_TOKEN` env var; **when it is unset every admin request is `401`** (fail-closed
+— an unconfigured deploy cannot be reset by a stranger). `reset-sessions` synchronously
+tears down every live session (Playwright contexts released, registry emptied) — including
+sessions mid-action — and is intended as the operator escape hatch when the registry has
+drifted into a stuck state and the eval loop is being told "503 capacity reached" on
+every create. Sessions are NOT tombstoned; subsequent requests against a purged id return
+`404 "Unknown session"`. Each reset logs a single line with the 8-char sha256 prefix of
+every closed session id (full ids are never logged).
+
 ## Behaviour notes
 
 - **Concurrency.** Actions on the *same* session are serialized by a per-session lock; a
