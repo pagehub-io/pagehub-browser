@@ -76,6 +76,9 @@ class SessionResponse(BaseModel):
     headless: bool
     viewport: ViewportModel
     current_url: str | None  # NOT subject to exclude_none — always emitted
+    # Set on POST /v1/sessions when an idle session was LRU-evicted to make room
+    # for this one. Always null on GET responses. Not subject to exclude_none.
+    evicted_session_id: str | None = None
 
 
 class SessionListResponse(BaseModel):
@@ -101,6 +104,7 @@ class MetricsResponse(BaseModel):
     sessions_reaped_total: int
     sessions_deleted_total: int
     sessions_rejected_total: int
+    sessions_lru_evicted_total: int
     actions_total: int
     action_errors_total: int
     browser_restarts_total: int
