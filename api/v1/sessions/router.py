@@ -28,7 +28,9 @@ def _iso(epoch_seconds: float) -> str:
     return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-def serialize_session(rec: SessionRecord, *, current_url: str | None) -> SessionResponse:
+def serialize_session(
+    rec: SessionRecord, *, current_url: str | None, evicted_session_id: str | None = None
+) -> SessionResponse:
     return SessionResponse(
         session_id=rec.session_id,
         created_at=_iso(rec.created_at),
@@ -37,6 +39,7 @@ def serialize_session(rec: SessionRecord, *, current_url: str | None) -> Session
         headless=rec.headless,
         viewport=ViewportModel(width=rec.viewport[0], height=rec.viewport[1]),
         current_url=current_url,
+        evicted_session_id=evicted_session_id,
     )
 
 
@@ -51,10 +54,14 @@ async def create_session(
         user_agent=body.user_agent,
     )
     try:
-        rec = await manager.create(opts, idle_timeout_seconds=body.idle_timeout_seconds)
+        result = await manager.create(opts, idle_timeout_seconds=body.idle_timeout_seconds)
     except SessionCapacityError as exc:
         raise capacity_http(exc, settings.reaper_interval_seconds)
-    return serialize_session(rec, current_url=rec.current_url)
+    return serialize_session(
+        result.record,
+        current_url=result.record.current_url,
+        evicted_session_id=result.evicted_session_id,
+    )
 
 
 @router.get("", response_model=SessionListResponse)

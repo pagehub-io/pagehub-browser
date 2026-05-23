@@ -45,7 +45,7 @@ is a Pydantic model.
 
 | Method & path | Body | Response |
 |---|---|---|
-| `POST /v1/sessions` | `headless`, `viewport_width`, `viewport_height`, `user_agent`, `idle_timeout_seconds` (all optional; idle clamped to `[30, 900]`) | `201` `{session_id, created_at, last_used_at, idle_timeout_seconds, headless, viewport, current_url}` — `current_url` is always present, `null` until the first `navigate` |
+| `POST /v1/sessions` | `headless`, `viewport_width`, `viewport_height`, `user_agent`, `idle_timeout_seconds` (all optional; idle clamped to `[30, 900]`) | `201` `{session_id, created_at, last_used_at, idle_timeout_seconds, headless, viewport, current_url, evicted_session_id}` — `current_url` is always present, `null` until the first `navigate`; `evicted_session_id` is non-null iff the LRU-evict-oldest-idle path ran (cap was hit and an idle session was reclaimed to make room) |
 | `GET /v1/sessions` | — | `{count, sessions: [...]}` (live only; does not bump the idle clock) |
 | `GET /v1/sessions/{id}` | — | `SessionResponse` with live `current_url` (status probe — does **not** count as activity) |
 | `DELETE /v1/sessions/{id}` | — | `204`. Second `DELETE` of the same id → `404 "Unknown session"` (explicit delete never tombstones) |
@@ -69,10 +69,13 @@ JSON responses (`image` is a `data:image/png;base64,…` data URI).
 
 `GET /health` → `{status, commit, engine, env, live_sessions}` (`commit` is the running
 build's short SHA — check it against `git rev-parse --short HEAD`).
-`GET /metrics` → JSON with the frozen 10-field set (`live_sessions`, `max_sessions`,
+`GET /metrics` → JSON with the frozen 11-field set (`live_sessions`, `max_sessions`,
 `sessions_created_total`, `sessions_reaped_total`, `sessions_deleted_total`,
-`sessions_rejected_total`, `actions_total`, `action_errors_total`,
-`browser_restarts_total`, `uptime_seconds`).
+`sessions_rejected_total`, `sessions_lru_evicted_total`, `actions_total`,
+`action_errors_total`, `browser_restarts_total`, `uptime_seconds`).
+`sessions_lru_evicted_total` counts admits-via-eviction (`POST /v1/sessions` succeeded
+because the oldest idle session was reclaimed); a nonzero rate in steady state is the
+signal that `MAX_SESSIONS` is undersized for the workload, not just a transient blip.
 
 ### Admin (bearer-token gated)
 
@@ -99,6 +102,15 @@ every closed session id (full ids are never logged).
   any session idle past its `idle_timeout` (default 300s). A reaped session's id is kept in
   a small tombstone LRU so the next request → `404 "Session '<id>' expired (idle > Ns)."`
   A session is not reliably gone until ≈ `idle_timeout + reaper_interval` after last use.
+- **Capacity & LRU eviction.** Cap = `MAX_SESSIONS` (default 20). When a `POST /v1/sessions`
+  hits the cap, the manager looks for the oldest session that is **safe to evict** (lock
+  not held, no activity in the last 5s) and closes it to make room — the response is
+  `201` with `evicted_session_id` naming the displaced session. If *every* session is
+  active (locked or used within the last 5s) the request gets the legacy
+  `503 + Retry-After` (this is genuine concurrent-overload back-pressure, not registry
+  drift). Evicted ids are **not tombstoned** — a later request against one gets generic
+  `404 "Unknown session"`. The operator escape hatch for a stuck registry is
+  `POST /v1/admin/reset-sessions` (see below).
 - **SSRF.** `navigate` to a non-http(s) scheme, a malformed URL, or a loopback / RFC1918 /
   link-local-or-metadata host → `400 "Refused to navigate to '<url>': <reason>."` A
   committed `context.route` interceptor also aborts redirects to literal internal IPs (no

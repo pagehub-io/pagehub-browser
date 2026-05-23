@@ -14,9 +14,14 @@ import uuid
 from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from api.engine.base import Engine, EngineSession, SessionOpts
+
+# A session is "idle enough to evict" iff its last activity was at least this many
+# seconds ago. Keeps the LRU eviction path from yanking a session out from under a
+# burst of legitimate concurrent traffic — that case should still back-pressure (503).
+EVICT_RECENT_ACTIVITY_WINDOW_S = 5.0
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +56,17 @@ class SessionBusy(Exception):
 
     def __init__(self) -> None:
         super().__init__("Session busy: another action is in progress.")
+
+
+class CreateResult(NamedTuple):
+    """Return value of SessionManager.create().
+
+    `evicted_session_id` is set iff the LRU-evict-oldest-idle path fired (capacity
+    was hit, but an idle session was reclaimed to make room). Otherwise None.
+    """
+
+    record: "SessionRecord"
+    evicted_session_id: str | None
 
 
 @dataclass
@@ -101,6 +117,7 @@ class SessionManager:
         self.sessions_reaped_total = 0
         self.sessions_deleted_total = 0
         self.sessions_rejected_total = 0
+        self.sessions_lru_evicted_total = 0
         self.actions_total = 0
         self.action_errors_total = 0
 
@@ -127,6 +144,7 @@ class SessionManager:
             "sessions_reaped_total": self.sessions_reaped_total,
             "sessions_deleted_total": self.sessions_deleted_total,
             "sessions_rejected_total": self.sessions_rejected_total,
+            "sessions_lru_evicted_total": self.sessions_lru_evicted_total,
             "actions_total": self.actions_total,
             "action_errors_total": self.action_errors_total,
             "browser_restarts_total": self.browser_restarts_total,
@@ -148,19 +166,75 @@ class SessionManager:
             return self.idle_timeout_default
         return max(self.idle_timeout_min, min(self.idle_timeout_max, requested))
 
-    async def create(self, opts: SessionOpts, *, idle_timeout_seconds: int | None) -> SessionRecord:
-        # Double-check guard: the cap check + insert below have no `await` between them, so
-        # they are atomic under the single-threaded event loop. The pre-check fails fast; the
-        # post-check catches a concurrent create that filled the cap during `new_session`.
+    def _oldest_evictable_idle(self) -> SessionRecord | None:
+        """Return the SessionRecord with the oldest `last_used_monotonic` that is safe
+        to evict (not closing, lock not held, no activity in the last
+        EVICT_RECENT_ACTIVITY_WINDOW_S seconds), or None if no session qualifies."""
+        now = self._clock()
+        candidates = [
+            rec
+            for rec in self._records.values()
+            if not rec.closing
+            and not rec.lock.locked()
+            and (now - rec.last_used_monotonic) >= EVICT_RECENT_ACTIVITY_WINDOW_S
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda r: r.last_used_monotonic)
+
+    async def _evict_one(self, rec: SessionRecord) -> None:
+        """Close one session synchronously to make room for a new create.
+
+        Does NOT acquire the per-session lock — the caller has already filtered
+        out locked sessions in `_oldest_evictable_idle`. This stays atomic under the
+        single-threaded event loop because there are no other awaits between the
+        candidate-selection here and the new-session insert below — the only `await`
+        here is `engine_session.close()`, which yields the loop, but on resume we
+        re-check capacity in `create()` before inserting.
+        """
+        rec.closing = True
+        with suppress(Exception):
+            await rec.engine_session.close()
+        self._records.pop(rec.session_id, None)
+        # No tombstone — evicted sessions and explicit DELETEs both return generic
+        # `Unknown session` 404 (the caller did not ask for them to expire).
+        self.sessions_lru_evicted_total += 1
+        logger.info(
+            "evicted-idle: sid=%s idle=%ss (cap=%d) to admit new session",
+            short(rec.session_id),
+            int(self._clock() - rec.last_used_monotonic),
+            self.max_sessions,
+        )
+
+    async def create(
+        self, opts: SessionOpts, *, idle_timeout_seconds: int | None
+    ) -> CreateResult:
+        # The cap check + insert path has no `await` once we have an engine_session, so
+        # it is atomic under the single-threaded event loop. The pre-check fails fast OR
+        # evicts the oldest idle to free a slot; the post-check (after the engine await)
+        # catches a concurrent create that filled the cap during `new_session`.
+        evicted_id: str | None = None
         if len(self._records) >= self.max_sessions:
-            self.sessions_rejected_total += 1
-            raise SessionCapacityError(self.max_sessions)
+            victim = self._oldest_evictable_idle()
+            if victim is None:
+                self.sessions_rejected_total += 1
+                raise SessionCapacityError(self.max_sessions)
+            evicted_id = victim.session_id
+            await self._evict_one(victim)
+
         engine_session = await self._engine.new_session(opts)
         if len(self._records) >= self.max_sessions:
-            with suppress(Exception):
-                await engine_session.close()
-            self.sessions_rejected_total += 1
-            raise SessionCapacityError(self.max_sessions)
+            # Concurrent create filled the cap during our await. Try one more LRU pass
+            # — if a slot can still be freed without disturbing an active session, take
+            # it; otherwise 503 back-pressure.
+            victim = self._oldest_evictable_idle()
+            if victim is None:
+                with suppress(Exception):
+                    await engine_session.close()
+                self.sessions_rejected_total += 1
+                raise SessionCapacityError(self.max_sessions)
+            evicted_id = victim.session_id
+            await self._evict_one(victim)
 
         sid = uuid.uuid4().hex
         while sid in self._records or sid in self._tombstones:  # documentation-grade
@@ -178,7 +252,7 @@ class SessionManager:
         )
         self._records[sid] = rec
         self.sessions_created_total += 1
-        return rec
+        return CreateResult(record=rec, evicted_session_id=evicted_id)
 
     def get(self, session_id: str) -> SessionRecord:
         rec = self._records.get(session_id)

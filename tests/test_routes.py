@@ -238,12 +238,58 @@ def test_missing_required_locator_422(client, path, body):
 
 
 def test_capacity_503_with_retry_after(client):
+    """Cap reached with the one live session still in its recent-activity window
+    -> 503 (no idle candidate to evict, same as the pre-LRU behaviour)."""
     mgr = client.app.state.manager
     mgr.max_sessions = 1
     _create(client)
     r = client.post("/v1/sessions", json={})
     assert r.status_code == 503
     assert "Retry-After" in r.headers
+
+
+def test_create_evicts_oldest_idle_and_reports_evicted_session_id(client):
+    """At cap with an idle session present -> 201 with evicted_session_id set."""
+    mgr = client.app.state.manager
+    mgr.max_sessions = 1
+    sid_old = _create(client)
+    # Drag the existing session past the 5s recent-activity window.
+    rec = mgr._records[sid_old]
+    rec.last_used_monotonic -= 10.0
+    old_engine = rec.engine_session
+
+    r = client.post("/v1/sessions", json={"headless": True})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["evicted_session_id"] == sid_old
+    sid_new = body["session_id"]
+    assert sid_new != sid_old
+    # The new session is live; the old one is gone (and its engine session was closed).
+    assert sid_new in mgr._records
+    assert sid_old not in mgr._records
+    assert old_engine.closed is True
+    # Subsequent action against the evicted id -> 404 Unknown session.
+    r = client.post(f"/v1/sessions/{sid_old}/navigate", json={"url": "https://example.com"})
+    assert r.status_code == 404
+    assert "Unknown session" in r.json()["detail"]
+
+
+def test_create_evicted_session_id_null_when_under_cap(client):
+    r = client.post("/v1/sessions", json={"headless": True})
+    assert r.status_code == 201
+    assert r.json()["evicted_session_id"] is None
+
+
+def test_create_503_when_all_sessions_active_no_eviction(client):
+    """Cap reached but every session was used within the last 5s -> 503 (back-pressure)."""
+    mgr = client.app.state.manager
+    mgr.max_sessions = 2
+    _create(client)
+    _create(client)  # both touched right now; recent-activity window protects them
+    r = client.post("/v1/sessions", json={"headless": True})
+    assert r.status_code == 503
+    assert "Retry-After" in r.headers
+    assert mgr.sessions_lru_evicted_total == 0
 
 
 @pytest.mark.parametrize("url,reason_fragment", [
@@ -466,8 +512,8 @@ def test_metrics_full_field_set_and_counters(client):
     body = r.json()
     expected_fields = {
         "live_sessions", "max_sessions", "sessions_created_total", "sessions_reaped_total",
-        "sessions_deleted_total", "sessions_rejected_total", "actions_total", "action_errors_total",
-        "browser_restarts_total", "uptime_seconds",
+        "sessions_deleted_total", "sessions_rejected_total", "sessions_lru_evicted_total",
+        "actions_total", "action_errors_total", "browser_restarts_total", "uptime_seconds",
     }
     assert set(body.keys()) == expected_fields
 
