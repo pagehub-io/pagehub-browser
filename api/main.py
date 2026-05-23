@@ -13,6 +13,7 @@ from api.engine.base import Engine
 from api.middleware import BodySizeLimitMiddleware, TwinHeaderMiddleware
 from api.service_router import router as service_router
 from api.session_manager import SessionManager, reaper_loop
+from api.v1.admin.router import router as admin_router
 from api.v1.sessions.actions.router import router as actions_router
 from api.v1.sessions.router import router as sessions_router
 
@@ -92,6 +93,7 @@ def create_app() -> FastAPI:
     app.include_router(service_router)
     app.include_router(sessions_router)
     app.include_router(actions_router)
+    app.include_router(admin_router)
     return app
 
 

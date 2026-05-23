@@ -34,6 +34,11 @@ class Settings(BaseSettings):
 
     sentry_dsn: str | None = None
 
+    # Bearer token gating /v1/admin/* endpoints (currently: reset-sessions). Fail-closed:
+    # when unset, every admin request is 401. Set this on any deploy that needs an
+    # operator escape hatch for state purges.
+    admin_auth_token: str | None = None
+
     port: int = 4010
     log_level: str = "INFO"
 
