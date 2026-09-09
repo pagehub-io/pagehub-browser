@@ -100,13 +100,19 @@ evals that keep passing: `no-match-404` (its click sends no `timeout`, so
 the browser default 5,000 applies under the seed's 15,000 request timeout)
 and `bad-css-400`.
 
-Tests: the fakes in `tests/fakes.py` replace the engine session wholesale,
-so these paths are only reachable through `tests/test_browser_integration.py`
-(`pytestmark = browser`, `make test-browser`). Cases: an element rendered
+Tests: unit cases in `tests/test_engine_locator_unit.py` drive
+`_resolve_single`, `_locator_error` and `_classify_playwright_error` with a
+stubbed Playwright locator and real Playwright error instances (strict-mode
+parsing, unparseable count, dead-target precedence, every timeout arm,
+the `remaining` deduction and clamp, `nth` skipping the count). Browser
+cases live in `tests/test_locator_auto_wait.py` (`pytestmark = browser`,
+`make test-browser`). Cases: an element rendered
 after a delay is clicked; zero match is a 404 with the documented message
 after `timeout`; malformed css on click is a 400 `Invalid css selector
-syntax`; an element attached but never visible fails at about `timeout`,
-not about 2 × `timeout`; a duplicate `data-testid` is a 409 on click, on
+syntax`; an element that attaches late and never becomes visible fails at
+about `timeout`, not about 2 × `timeout`, with the row-157 "to be
+actionable" message; an `nth` beyond the match count is a 404 after
+`timeout`; `wait-for hidden`/`detached` on zero match is still a success; a duplicate `data-testid` is a 409 on click, on
 `wait-for visible` and on `wait-for hidden`, with the count in the body;
 `options.nth` bypasses the strict check; get-text on a present-but-hidden element is a 409 with the row-157
 message after `timeout`.

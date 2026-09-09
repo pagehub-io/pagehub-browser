@@ -8,7 +8,7 @@ import logging
 import re
 import time
 from collections import deque
-from typing import Any
+from typing import Any, Literal
 
 from playwright.async_api import (
     Browser,
@@ -22,6 +22,7 @@ from playwright.async_api import (
     async_playwright,
 )
 from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Locator as PwLocator
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from api.config import settings
@@ -76,6 +77,23 @@ def _is_dead_target_error(message: str) -> bool:
 
 
 _STRICT_MODE_RE = re.compile(r"strict mode violation.*?resolved to (\d+) elements", re.S)
+
+
+def _locator_error(exc: PlaywrightError, loc: Locator) -> Exception:
+    """Unified mapping for a non-timeout Playwright error raised while
+    resolving or counting a locator: dead target first, then bad css/xpath
+    grammar (400), else the general classification."""
+    msg = getattr(exc, "message", str(exc))
+    if _is_dead_target_error(msg):
+        return EngineCrash(msg)
+    if loc.strategy in ("css", "xpath"):
+        return InvalidLocatorSyntax(loc.strategy, loc.value, msg)
+    return _classify_playwright_error(exc, locator=loc)
+
+
+def _action_timeout(locator: Locator, timeout: int) -> ActionTimeout:
+    """Row-157 message for the action phase of a single-element verb."""
+    return ActionTimeout(f"Timed out after {timeout}ms waiting for {locator.repr_str()} to be actionable.")
 
 
 def _classify_playwright_error(exc: PlaywrightError, *, locator: Locator | None = None) -> Exception:
@@ -189,24 +207,15 @@ class PlaywrightEngineSession(EngineSession):
             pw_loc = pw_loc.nth(opts.nth)
         return pw_loc
 
-    def _locator_error(self, exc: PlaywrightError, loc: Locator) -> Exception:
-        """Unified mapping for a non-timeout Playwright error raised while
-        resolving or counting a locator: dead target first, then bad
-        css/xpath grammar (400), else the general classification."""
-        msg = getattr(exc, "message", str(exc))
-        if _is_dead_target_error(msg):
-            return EngineCrash(msg)
-        if loc.strategy in ("css", "xpath"):
-            return InvalidLocatorSyntax(loc.strategy, loc.value, msg)
-        return _classify_playwright_error(exc, locator=loc)
-
     async def _count(self, pw_loc, loc: Locator) -> int:
         try:
             return await pw_loc.count()
         except PlaywrightError as exc:
-            raise self._locator_error(exc, loc) from exc
+            raise _locator_error(exc, loc) from exc
 
-    async def _resolve_single(self, loc: Locator, timeout: int, *, state: str = "attached"):
+    async def _resolve_single(
+        self, loc: Locator, timeout: int, *, state: Literal["attached", "visible"] = "attached"
+    ) -> tuple[PwLocator, int]:
         """Resolve to exactly one element, waiting up to ``timeout`` for it to
         reach ``state`` first (Playwright's actionability model: an element
         that renders a few hundred milliseconds late is not a 404).
@@ -220,7 +229,7 @@ class PlaywrightEngineSession(EngineSession):
         pw_loc = self._resolve(loc)
         started = time.monotonic()
         try:
-            await pw_loc.first.wait_for(state=state, timeout=timeout)  # type: ignore[arg-type]
+            await pw_loc.first.wait_for(state=state, timeout=timeout)
         except PlaywrightTimeoutError as exc:
             if state == "attached":
                 raise ElementNotFound(loc.repr_str()) from exc
@@ -233,7 +242,7 @@ class PlaywrightEngineSession(EngineSession):
                 f"Timed out after {timeout}ms waiting for {loc.repr_str()} to be {state}."
             ) from exc
         except PlaywrightError as exc:
-            raise self._locator_error(exc, loc) from exc
+            raise _locator_error(exc, loc) from exc
         remaining = max(1, timeout - int((time.monotonic() - started) * 1000))
         if loc.options is not None and loc.options.nth is not None:
             return pw_loc, remaining
@@ -295,6 +304,8 @@ class PlaywrightEngineSession(EngineSession):
         pw_loc, remaining = await self._resolve_single(locator, timeout)
         try:
             await pw_loc.click(timeout=remaining)
+        except PlaywrightTimeoutError as exc:
+            raise _action_timeout(locator, timeout) from exc
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
 
@@ -305,6 +316,8 @@ class PlaywrightEngineSession(EngineSession):
                 await pw_loc.fill(text, timeout=remaining)
             else:
                 await pw_loc.press_sequentially(text, timeout=remaining)
+        except PlaywrightTimeoutError as exc:
+            raise _action_timeout(locator, timeout) from exc
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
 
@@ -312,6 +325,8 @@ class PlaywrightEngineSession(EngineSession):
         pw_loc, remaining = await self._resolve_single(locator, timeout)
         try:
             await pw_loc.select_option(value, timeout=remaining)
+        except PlaywrightTimeoutError as exc:
+            raise _action_timeout(locator, timeout) from exc
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
 
@@ -319,6 +334,8 @@ class PlaywrightEngineSession(EngineSession):
         pw_loc, remaining = await self._resolve_single(locator, timeout)
         try:
             await pw_loc.hover(timeout=remaining)
+        except PlaywrightTimeoutError as exc:
+            raise _action_timeout(locator, timeout) from exc
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
 
@@ -329,6 +346,10 @@ class PlaywrightEngineSession(EngineSession):
             else:
                 pw_loc, remaining = await self._resolve_single(locator, timeout)
                 await pw_loc.press(key, timeout=remaining)
+        except PlaywrightTimeoutError as exc:
+            if locator is not None:
+                raise _action_timeout(locator, timeout) from exc
+            raise _classify_playwright_error(exc) from exc
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
 
@@ -381,6 +402,8 @@ class PlaywrightEngineSession(EngineSession):
         pw_loc, remaining = await self._resolve_single(locator, timeout, state="visible")
         try:
             text = await pw_loc.text_content(timeout=remaining)
+        except PlaywrightTimeoutError as exc:
+            raise _action_timeout(locator, timeout) from exc
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
         return text or ""
@@ -396,6 +419,8 @@ class PlaywrightEngineSession(EngineSession):
             if outer:
                 return await pw_loc.evaluate("el => el.outerHTML")
             return await pw_loc.inner_html(timeout=remaining)
+        except PlaywrightTimeoutError as exc:
+            raise _action_timeout(locator, timeout) from exc
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
 
@@ -403,6 +428,8 @@ class PlaywrightEngineSession(EngineSession):
         pw_loc, remaining = await self._resolve_single(locator, timeout)
         try:
             value = await pw_loc.get_attribute(attribute, timeout=remaining)
+        except PlaywrightTimeoutError as exc:
+            raise _action_timeout(locator, timeout) from exc
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
         if value is None:
@@ -411,10 +438,7 @@ class PlaywrightEngineSession(EngineSession):
 
     async def find(self, locator: Locator) -> list[ElementInfo]:
         pw_loc = self._resolve(locator)
-        try:
-            count = await self._count(pw_loc, locator)
-        except PlaywrightError as exc:
-            raise _classify_playwright_error(exc, locator=locator) from exc
+        count = await self._count(pw_loc, locator)
         out: list[ElementInfo] = []
         for i in range(min(count, 50)):
             el = pw_loc.nth(i)
