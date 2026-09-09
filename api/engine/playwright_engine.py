@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+import time
 from collections import deque
 from typing import Any
 
@@ -73,6 +75,9 @@ def _is_dead_target_error(message: str) -> bool:
     return any(n in low for n in needles)
 
 
+_STRICT_MODE_RE = re.compile(r"strict mode violation.*?resolved to (\d+) elements", re.S)
+
+
 def _classify_playwright_error(exc: PlaywrightError, *, locator: Locator | None = None) -> Exception:
     msg = exc.message if hasattr(exc, "message") else str(exc)
     if isinstance(exc, PlaywrightTimeoutError):
@@ -81,6 +86,14 @@ def _classify_playwright_error(exc: PlaywrightError, *, locator: Locator | None 
         return ActionTimeout("Timed out.")
     if _is_dead_target_error(msg):
         return EngineCrash(msg)
+    # A strict-mode violation is Playwright's "matched more than one" on a
+    # strict locator (wait_for, click, text_content, ...). Report it as the
+    # same 409 every other verb uses; if the count cannot be parsed, fall
+    # through rather than invent one.
+    if "strict mode violation" in msg:
+        m = _STRICT_MODE_RE.search(msg)
+        if m is not None:
+            return LocatorAmbiguous(int(m.group(1)))
     return RuntimeEvalError(msg)
 
 
@@ -176,25 +189,60 @@ class PlaywrightEngineSession(EngineSession):
             pw_loc = pw_loc.nth(opts.nth)
         return pw_loc
 
+    def _locator_error(self, exc: PlaywrightError, loc: Locator) -> Exception:
+        """Unified mapping for a non-timeout Playwright error raised while
+        resolving or counting a locator: dead target first, then bad
+        css/xpath grammar (400), else the general classification."""
+        msg = getattr(exc, "message", str(exc))
+        if _is_dead_target_error(msg):
+            return EngineCrash(msg)
+        if loc.strategy in ("css", "xpath"):
+            return InvalidLocatorSyntax(loc.strategy, loc.value, msg)
+        return _classify_playwright_error(exc, locator=loc)
+
     async def _count(self, pw_loc, loc: Locator) -> int:
         try:
             return await pw_loc.count()
         except PlaywrightError as exc:
-            if loc.strategy in ("css", "xpath"):
-                raise InvalidLocatorSyntax(loc.strategy, loc.value, getattr(exc, "message", str(exc)))
-            raise
+            raise self._locator_error(exc, loc) from exc
 
-    async def _resolve_single(self, loc: Locator, timeout: int):
-        """Resolve to exactly one element: 0 -> ElementNotFound, >1 (no nth) -> LocatorAmbiguous."""
+    async def _resolve_single(self, loc: Locator, timeout: int, *, state: str = "attached"):
+        """Resolve to exactly one element, waiting up to ``timeout`` for it to
+        reach ``state`` first (Playwright's actionability model: an element
+        that renders a few hundred milliseconds late is not a 404).
+
+        Returns ``(pw_loc, remaining_ms)``; callers pass ``remaining_ms`` to
+        the action so ``timeout`` stays one budget for wait plus action.
+        0 matches after the wait -> ElementNotFound (404, unchanged message);
+        >1 without nth -> LocatorAmbiguous (409); an element that exists but
+        never reached a non-``attached`` state -> ActionTimeout (409).
+        """
         pw_loc = self._resolve(loc)
+        started = time.monotonic()
+        try:
+            await pw_loc.first.wait_for(state=state, timeout=timeout)  # type: ignore[arg-type]
+        except PlaywrightTimeoutError as exc:
+            if state == "attached":
+                raise ElementNotFound(loc.repr_str()) from exc
+            count = await self._count(pw_loc, loc)
+            if count == 0:
+                raise ElementNotFound(loc.repr_str()) from exc
+            if count > 1 and (loc.options is None or loc.options.nth is None):
+                raise LocatorAmbiguous(count) from exc
+            raise ActionTimeout(
+                f"Timed out after {timeout}ms waiting for {loc.repr_str()} to be {state}."
+            ) from exc
+        except PlaywrightError as exc:
+            raise self._locator_error(exc, loc) from exc
+        remaining = max(1, timeout - int((time.monotonic() - started) * 1000))
         if loc.options is not None and loc.options.nth is not None:
-            return pw_loc
+            return pw_loc, remaining
         count = await self._count(pw_loc, loc)
         if count == 0:
             raise ElementNotFound(loc.repr_str())
         if count > 1:
             raise LocatorAmbiguous(count)
-        return pw_loc
+        return pw_loc, remaining
 
     # ---- navigate ----
 
@@ -244,33 +292,33 @@ class PlaywrightEngineSession(EngineSession):
     # ---- interaction ----
 
     async def click(self, locator: Locator, timeout: int) -> None:
-        pw_loc = await self._resolve_single(locator, timeout)
+        pw_loc, remaining = await self._resolve_single(locator, timeout)
         try:
-            await pw_loc.click(timeout=timeout)
+            await pw_loc.click(timeout=remaining)
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
 
     async def type(self, locator: Locator, text: str, clear: bool, timeout: int) -> None:
-        pw_loc = await self._resolve_single(locator, timeout)
+        pw_loc, remaining = await self._resolve_single(locator, timeout)
         try:
             if clear:
-                await pw_loc.fill(text, timeout=timeout)
+                await pw_loc.fill(text, timeout=remaining)
             else:
-                await pw_loc.press_sequentially(text, timeout=timeout)
+                await pw_loc.press_sequentially(text, timeout=remaining)
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
 
     async def select(self, locator: Locator, value: str, timeout: int) -> None:
-        pw_loc = await self._resolve_single(locator, timeout)
+        pw_loc, remaining = await self._resolve_single(locator, timeout)
         try:
-            await pw_loc.select_option(value, timeout=timeout)
+            await pw_loc.select_option(value, timeout=remaining)
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
 
     async def hover(self, locator: Locator, timeout: int) -> None:
-        pw_loc = await self._resolve_single(locator, timeout)
+        pw_loc, remaining = await self._resolve_single(locator, timeout)
         try:
-            await pw_loc.hover(timeout=timeout)
+            await pw_loc.hover(timeout=remaining)
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
 
@@ -279,8 +327,8 @@ class PlaywrightEngineSession(EngineSession):
             if locator is None:
                 await self._page.keyboard.press(key)
             else:
-                pw_loc = await self._resolve_single(locator, timeout)
-                await pw_loc.press(key, timeout=timeout)
+                pw_loc, remaining = await self._resolve_single(locator, timeout)
+                await pw_loc.press(key, timeout=remaining)
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
 
@@ -327,9 +375,12 @@ class PlaywrightEngineSession(EngineSession):
                 return await self._page.inner_text("body", timeout=timeout)
             except PlaywrightError as exc:
                 raise _classify_playwright_error(exc) from exc
-        pw_loc = await self._resolve_single(locator, timeout)
+        # get-text waits for *visible*: platform/playwright preceded it with
+        # wait_for_selector(visible), and text_content() on a hidden element
+        # would return text the platform never read.
+        pw_loc, remaining = await self._resolve_single(locator, timeout, state="visible")
         try:
-            text = await pw_loc.text_content(timeout=timeout)
+            text = await pw_loc.text_content(timeout=remaining)
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
         return text or ""
@@ -340,18 +391,18 @@ class PlaywrightEngineSession(EngineSession):
                 return await self._page.evaluate("() => document.documentElement.outerHTML")
             except PlaywrightError as exc:
                 raise _classify_playwright_error(exc) from exc
-        pw_loc = await self._resolve_single(locator, timeout)
+        pw_loc, remaining = await self._resolve_single(locator, timeout)
         try:
             if outer:
                 return await pw_loc.evaluate("el => el.outerHTML")
-            return await pw_loc.inner_html(timeout=timeout)
+            return await pw_loc.inner_html(timeout=remaining)
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
 
     async def get_attribute(self, locator: Locator, attribute: str, timeout: int) -> str:
-        pw_loc = await self._resolve_single(locator, timeout)
+        pw_loc, remaining = await self._resolve_single(locator, timeout)
         try:
-            value = await pw_loc.get_attribute(attribute, timeout=timeout)
+            value = await pw_loc.get_attribute(attribute, timeout=remaining)
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
         if value is None:
@@ -388,8 +439,8 @@ class PlaywrightEngineSession(EngineSession):
             if locator is None:
                 raw = await self._page.screenshot(type="png", full_page=full_page, timeout=timeout)
             else:
-                pw_loc = await self._resolve_single(locator, timeout)
-                raw = await pw_loc.screenshot(type="png", timeout=timeout)
+                pw_loc, remaining = await self._resolve_single(locator, timeout)
+                raw = await pw_loc.screenshot(type="png", timeout=remaining)
         except PlaywrightTimeoutError as exc:
             if locator is not None:
                 raise ActionTimeout(f"Timed out after {timeout}ms waiting for {locator.repr_str()}.") from exc
