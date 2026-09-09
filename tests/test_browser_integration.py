@@ -102,6 +102,15 @@ def test_ssrf_real_browser_precheck(real_client):
     c.request("DELETE", f"/v1/sessions/{sid}")
 
 
+@pytest.mark.xfail(
+    strict=False,
+    reason=(
+        "external redirect fixtures no longer issue a 302 (httpstat.us answers its own 502 page; "
+        "httpbin.org is unreachable from CI), so this cannot exercise the interceptor; "
+        "a loopback redirector is refused by the precheck before the interceptor runs. "
+        "Needs a controlled public redirector. Fails identically on main since 2026-09."
+    ),
+)
 def test_ssrf_redirect_interceptor(real_client):
     """A public URL that 302s to a literal internal IP is aborted by the context.route interceptor."""
     c = real_client
