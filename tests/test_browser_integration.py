@@ -108,7 +108,7 @@ def test_ssrf_real_browser_precheck(real_client):
         "Playwright/Chromium does not route redirected requests (crNetworkManager.js: a request "
         "with redirectedFrom gets Fetch.continueRequest, no route), so the navigation interceptor "
         "never sees a redirect hop; verified 2026-09-09. Flips to XPASS, loudly, when the redirect "
-        "gap is closed (separate security-reviewed plan)."
+        "gap is closed (separate security-reviewed plan; pagehub-browser#5)."
     ),
 )
 def test_ssrf_redirect_interceptor_blocks_redirect_hop(monkeypatch):
