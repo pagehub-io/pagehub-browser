@@ -111,16 +111,22 @@ def test_ssrf_real_browser_precheck(real_client):
         "gap is closed (separate security-reviewed plan)."
     ),
 )
-def test_ssrf_redirect_interceptor_blocks_redirect_hop():
+def test_ssrf_redirect_interceptor_blocks_redirect_hop(monkeypatch):
     """Deterministic: fulfil a public-looking URL with a 302 to a live loopback
     listener and expect the interceptor to abort the hop (BlockedNavigation)."""
     import asyncio
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+    from api.config import settings
     from api.engine.base import SessionOpts
     from api.engine.errors import BlockedNavigation
     from api.engine.playwright_engine import PlaywrightEngine
+
+    # Pin the guard on regardless of a developer's .env, so the XFAIL is for
+    # the redirect gap and the flip-to-XPASS after the fix is real.
+    monkeypatch.setattr(settings, "env", "staging")
+    monkeypatch.setattr(settings, "browser_allow_private_hosts", False)
 
     class _Secret(BaseHTTPRequestHandler):
         hits: list[str] = []

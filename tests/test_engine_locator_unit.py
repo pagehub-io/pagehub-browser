@@ -148,14 +148,13 @@ async def test_generic_error_css_is_400(monkeypatch):
 async def test_remaining_deducts_elapsed(monkeypatch):
     # Scripted clock: the wait "takes" 200 ms without sleeping, so the
     # assertion is exact and cannot flake on a loaded runner.
-    calls = [0]
-
-    def clock() -> float:  # first read 100.0 (start), every later read 100.2
-        calls[0] += 1
-        return 100.0 if calls[0] == 1 else 100.2
-
-    monkeypatch.setattr("api.engine.playwright_engine.time.monotonic", clock)
     fake = FakePwLoc(1)
+    # State-driven so an extra clock read by the event loop cannot skew the
+    # result: 100.0 until the wait has run, 100.2 after (200 ms elapsed).
+    monkeypatch.setattr(
+        "api.engine.playwright_engine.time.monotonic",
+        lambda: 100.2 if fake.wait_calls else 100.0,
+    )
     s = _session(fake, monkeypatch)
     pw, remaining = await s._resolve_single(_loc(), 1000)
     assert pw is fake

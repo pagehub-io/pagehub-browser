@@ -151,7 +151,7 @@ def navigation_request_is_blocked(url: str) -> bool:
     Used by PlaywrightEngine's context.route handler for top-level navigation requests.
     NOTE: it does not see redirect hops; Playwright continues redirected requests without
     routing them (verified 2026-09-09), so the redirect-to-internal-IP case documented in
-    PLAN.md as closed is open. Tracked as a security follow-up with its own plan.
+    PLAN.md as closed is open. Tracked in #5 (needs its own security-reviewed plan).
     """
     try:
         parts = urlsplit(url)

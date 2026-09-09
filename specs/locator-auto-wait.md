@@ -133,4 +133,4 @@ hops. The interceptor therefore covers the initial navigation only; the
 redirect-to-internal-IP case PLAN.md describes as closed is open. This PR
 records the fact (docstrings, PLAN.md correction, a deterministic test marked
 `xfail(strict=True)` so it flips loudly when fixed, and a unit test of the
-handler's own logic). The fix is a separate, security-reviewed plan.
+handler's own logic). The fix is a separate, security-reviewed plan (tracked in pagehub-browser#5).
