@@ -128,6 +128,12 @@ class PlaywrightEngineSession(EngineSession):
         page.on("response", self._on_response)
 
     async def _navigation_interceptor(self, route: Route) -> None:
+        """context.route handler: abort a top-level navigation to a blocked
+        literal IP / scheme. KNOWN GAP (verified 2026-09-09): Playwright's
+        Chromium network manager continues *redirected* requests itself
+        without constructing a route, so this handler is never invoked for a
+        redirect hop; a public URL that 302s to an internal literal IP is not
+        caught here. See specs/locator-auto-wait.md → "Redirect gap"."""
         request = route.request
         try:
             if request.is_navigation_request() and navigation_request_is_blocked(request.url):
@@ -243,14 +249,13 @@ class PlaywrightEngineSession(EngineSession):
             ) from exc
         except PlaywrightError as exc:
             raise _locator_error(exc, loc) from exc
+        if loc.options is None or loc.options.nth is None:
+            count = await self._count(pw_loc, loc)
+            if count == 0:
+                raise ElementNotFound(loc.repr_str())
+            if count > 1:
+                raise LocatorAmbiguous(count)
         remaining = max(1, timeout - int((time.monotonic() - started) * 1000))
-        if loc.options is not None and loc.options.nth is not None:
-            return pw_loc, remaining
-        count = await self._count(pw_loc, loc)
-        if count == 0:
-            raise ElementNotFound(loc.repr_str())
-        if count > 1:
-            raise LocatorAmbiguous(count)
         return pw_loc, remaining
 
     # ---- navigate ----
@@ -417,7 +422,7 @@ class PlaywrightEngineSession(EngineSession):
         pw_loc, remaining = await self._resolve_single(locator, timeout)
         try:
             if outer:
-                return await pw_loc.evaluate("el => el.outerHTML")
+                return await pw_loc.evaluate("el => el.outerHTML", timeout=remaining)
             return await pw_loc.inner_html(timeout=remaining)
         except PlaywrightTimeoutError as exc:
             raise _action_timeout(locator, timeout) from exc
@@ -467,7 +472,7 @@ class PlaywrightEngineSession(EngineSession):
                 raw = await pw_loc.screenshot(type="png", timeout=remaining)
         except PlaywrightTimeoutError as exc:
             if locator is not None:
-                raise ActionTimeout(f"Timed out after {timeout}ms waiting for {locator.repr_str()}.") from exc
+                raise _action_timeout(locator, timeout) from exc
             raise ActionTimeout(f"Timed out after {timeout}ms taking a screenshot.") from exc
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc

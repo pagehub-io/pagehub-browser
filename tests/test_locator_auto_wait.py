@@ -126,11 +126,15 @@ def test_late_attached_but_never_visible_shares_one_budget(browser_client, local
 
 
 def test_nth_beyond_match_count_is_404_after_timeout(browser_client, local_pages):
+    import time
+
     sid = _session(browser_client, local_pages, "/dup")
+    started = time.monotonic()
     r = browser_client.post(
         f"/v1/sessions/{sid}/get-text",
         json={"locator": {"strategy": "testid", "value": "dup", "options": {"nth": 5}}, "timeout": 400},
     )
+    assert time.monotonic() - started >= 0.4
     assert r.status_code == 404 and "no element matched" in r.json()["detail"]
 
 

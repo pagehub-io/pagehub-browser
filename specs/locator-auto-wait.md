@@ -120,3 +120,17 @@ message after `timeout`.
 This is a separate PR on that repo with its own review; it is listed in
 the partner README as a minimum version.
 
+## Redirect gap (found during this change's review; not fixed here)
+
+While checking why `test_ssrf_redirect_interceptor` fails, the review executed
+a route-fulfilled 302 from a public-looking URL to a loopback listener with
+`ENV=staging`: the navigation completed, the interceptor was consulted for
+zero URLs, the loopback server was hit, and the page text was readable. Cause,
+in the bundled driver (`crNetworkManager.js`, `redirectedFrom` →
+`Fetch.continueRequest`): Playwright continues redirected requests itself and
+never constructs a route, so `context.route` handlers do not run for redirect
+hops. The interceptor therefore covers the initial navigation only; the
+redirect-to-internal-IP case PLAN.md describes as closed is open. This PR
+records the fact (docstrings, PLAN.md correction, a deterministic test marked
+`xfail(strict=True)` so it flips loudly when fixed, and a unit test of the
+handler's own logic). The fix is a separate, security-reviewed plan.

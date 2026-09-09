@@ -1,7 +1,5 @@
-"""Reviewer scratch: unit-level coverage of the auto-wait engine code with NO browser.
-
-Proves the paths the spec calls 'only reachable through browser tests' are reachable
-with a stubbed Playwright locator + real PlaywrightError/TimeoutError instances.
+"""Unit cases for locator resolution and the navigation interceptor: no browser,
+a stubbed Playwright locator / route and real Playwright error instances.
 """
 
 from __future__ import annotations
@@ -148,11 +146,20 @@ async def test_generic_error_css_is_400(monkeypatch):
 # ---- _resolve_single success path + remaining ----
 
 async def test_remaining_deducts_elapsed(monkeypatch):
-    fake = FakePwLoc(1, wait_delay=0.2)
+    # Scripted clock: the wait "takes" 200 ms without sleeping, so the
+    # assertion is exact and cannot flake on a loaded runner.
+    calls = [0]
+
+    def clock() -> float:  # first read 100.0 (start), every later read 100.2
+        calls[0] += 1
+        return 100.0 if calls[0] == 1 else 100.2
+
+    monkeypatch.setattr("api.engine.playwright_engine.time.monotonic", clock)
+    fake = FakePwLoc(1)
     s = _session(fake, monkeypatch)
     pw, remaining = await s._resolve_single(_loc(), 1000)
     assert pw is fake
-    assert 650 <= remaining <= 800, remaining
+    assert remaining == 800, remaining
     assert isinstance(remaining, int)
 
 
@@ -181,3 +188,54 @@ async def test_success_zero_after_wait_is_404(monkeypatch):
     s = _session(FakePwLoc(0), monkeypatch)
     with pytest.raises(ElementNotFound):
         await s._resolve_single(_loc(), 500)
+
+
+# ---- navigation interceptor (handler logic only; redirect hops never reach it) ----
+
+class _FakeRequest:
+    def __init__(self, url: str, nav: bool = True) -> None:
+        self.url = url
+        self._nav = nav
+
+    def is_navigation_request(self) -> bool:
+        return self._nav
+
+
+class _FakeRoute:
+    def __init__(self, url: str, nav: bool = True) -> None:
+        self.request = _FakeRequest(url, nav)
+        self.aborted: str | None = None
+        self.continued = False
+
+    async def abort(self, reason: str) -> None:
+        self.aborted = reason
+
+    async def continue_(self) -> None:
+        self.continued = True
+
+
+def _bare_session(monkeypatch) -> PlaywrightEngineSession:
+    monkeypatch.setattr("api.engine.playwright_engine.settings.env", "staging", raising=False)
+    s = object.__new__(PlaywrightEngineSession)
+    s._last_blocked_nav = None
+    return s
+
+
+@pytest.mark.asyncio
+async def test_interceptor_aborts_literal_internal_ip_navigation(monkeypatch):
+    s = _bare_session(monkeypatch)
+    route = _FakeRoute("http://169.254.169.254/latest/meta-data/")
+    await s._navigation_interceptor(route)
+    assert route.aborted == "aborted" and not route.continued
+    assert s._last_blocked_nav == route.request.url
+
+
+@pytest.mark.asyncio
+async def test_interceptor_continues_public_and_subresource_requests(monkeypatch):
+    s = _bare_session(monkeypatch)
+    public = _FakeRoute("https://example.com/")
+    await s._navigation_interceptor(public)
+    assert public.continued and public.aborted is None
+    sub = _FakeRoute("http://169.254.169.254/x.png", nav=False)
+    await s._navigation_interceptor(sub)
+    assert sub.continued and sub.aborted is None  # sub-resources are the documented residual
