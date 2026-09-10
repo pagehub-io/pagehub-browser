@@ -595,7 +595,7 @@ class PlaywrightEngineSession(EngineSession):
         # Unreachable: the final iteration (attempt == retries) always returns on
         # success or re-raises. Explicit guard so a future loop-bound edit can't
         # silently fall through and return None.
-        raise AssertionError("unreachable: _evaluate_settled retry loop exhausted")
+        raise RuntimeError("unreachable: _evaluate_settled retry loop exhausted")
 
     async def local_storage(self, action: str, key: str | None, value: str | None) -> str:
         try:
