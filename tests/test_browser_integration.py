@@ -102,18 +102,67 @@ def test_ssrf_real_browser_precheck(real_client):
     c.request("DELETE", f"/v1/sessions/{sid}")
 
 
-def test_ssrf_redirect_interceptor(real_client):
-    """A public URL that 302s to a literal internal IP is aborted by the context.route interceptor."""
-    c = real_client
-    sid = c.post("/v1/sessions", json={"headless": True}).json()["session_id"]
-    # nip.io / a redirect service that bounces to 127.0.0.1; httpstat.us supports a Location.
-    redirect_url = "https://httpstat.us/302?Location=http://169.254.169.254/"
-    r = c.post(f"/v1/sessions/{sid}/navigate", json={"url": redirect_url})
-    # The redirect either aborts (400 host not allowed) or — if the fixture is unreachable — a 502.
-    assert r.status_code in (400, 502)
-    if r.status_code == 400:
-        assert "host not allowed" in r.json()["detail"]
-    c.request("DELETE", f"/v1/sessions/{sid}")
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Playwright/Chromium does not route redirected requests (crNetworkManager.js: a request "
+        "with redirectedFrom gets Fetch.continueRequest, no route), so the navigation interceptor "
+        "never sees a redirect hop; verified 2026-09-09. Flips to XPASS, loudly, when the redirect "
+        "gap is closed (separate security-reviewed plan; pagehub-browser#5)."
+    ),
+)
+def test_ssrf_redirect_interceptor_blocks_redirect_hop(monkeypatch):
+    """Deterministic: fulfil a public-looking URL with a 302 to a live loopback
+    listener and expect the interceptor to abort the hop (BlockedNavigation)."""
+    import asyncio
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from api.config import settings
+    from api.engine.base import SessionOpts
+    from api.engine.errors import BlockedNavigation
+    from api.engine.playwright_engine import PlaywrightEngine
+
+    # Pin the guard on regardless of a developer's .env, so the XFAIL is for
+    # the redirect gap and the flip-to-XPASS after the fix is real.
+    monkeypatch.setattr(settings, "env", "staging")
+    monkeypatch.setattr(settings, "browser_allow_private_hosts", False)
+
+    class _Secret(BaseHTTPRequestHandler):
+        hits: list[str] = []
+
+        def do_GET(self):  # noqa: N802
+            _Secret.hits.append(self.path)
+            body = b"<html><title>SECRET</title><body>INTERNAL-ONLY</body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):  # noqa: ANN002
+            pass
+
+    async def scenario() -> None:
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _Secret)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        target = f"http://127.0.0.1:{srv.server_address[1]}/secret"
+        engine = PlaywrightEngine()
+        sess = await engine.new_session(SessionOpts())
+        try:
+            async def fulfil(route, request):  # noqa: ANN001
+                await route.fulfill(status=302, headers={"Location": target}, body="")
+
+            await sess._context.route("http://example.com/redir", fulfil)
+            with pytest.raises(BlockedNavigation):
+                await sess.navigate("http://example.com/redir", "load", 15000)
+            assert _Secret.hits == []
+        finally:
+            await engine.close()
+            srv.shutdown()
+            srv.server_close()
+
+    asyncio.run(scenario())
 
 
 def test_evaluate_timeout_real(real_client):

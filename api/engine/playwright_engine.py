@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+import time
 from collections import deque
-from typing import Any
+from typing import Any, Literal
 
 from playwright.async_api import (
     Browser,
@@ -20,6 +22,7 @@ from playwright.async_api import (
     async_playwright,
 )
 from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Locator as PwLocator
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from api.config import settings
@@ -50,6 +53,9 @@ from api.ssrf import navigation_request_is_blocked
 
 logger = logging.getLogger(__name__)
 
+# Sentinel distinguishing "no evaluate arg" from an explicit ``None`` arg.
+_NO_ARG: Any = object()
+
 _CHROMIUM_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
 
 _FIND_ATTRS_JS = """el => {
@@ -73,6 +79,26 @@ def _is_dead_target_error(message: str) -> bool:
     return any(n in low for n in needles)
 
 
+_STRICT_MODE_RE = re.compile(r"strict mode violation.*?resolved to (\d+) elements", re.S)
+
+
+def _locator_error(exc: PlaywrightError, loc: Locator) -> Exception:
+    """Unified mapping for a non-timeout Playwright error raised while
+    resolving or counting a locator: dead target first, then bad css/xpath
+    grammar (400), else the general classification."""
+    msg = getattr(exc, "message", str(exc))
+    if _is_dead_target_error(msg):
+        return EngineCrash(msg)
+    if loc.strategy in ("css", "xpath"):
+        return InvalidLocatorSyntax(loc.strategy, loc.value, msg)
+    return _classify_playwright_error(exc, locator=loc)
+
+
+def _action_timeout(locator: Locator, timeout: int) -> ActionTimeout:
+    """Row-157 message for the action phase of a single-element verb."""
+    return ActionTimeout(f"Timed out after {timeout}ms waiting for {locator.repr_str()} to be actionable.")
+
+
 def _classify_playwright_error(exc: PlaywrightError, *, locator: Locator | None = None) -> Exception:
     msg = exc.message if hasattr(exc, "message") else str(exc)
     if isinstance(exc, PlaywrightTimeoutError):
@@ -81,6 +107,14 @@ def _classify_playwright_error(exc: PlaywrightError, *, locator: Locator | None 
         return ActionTimeout("Timed out.")
     if _is_dead_target_error(msg):
         return EngineCrash(msg)
+    # A strict-mode violation is Playwright's "matched more than one" on a
+    # strict locator (wait_for, click, text_content, ...). Report it as the
+    # same 409 every other verb uses; if the count cannot be parsed, fall
+    # through rather than invent one.
+    if "strict mode violation" in msg:
+        m = _STRICT_MODE_RE.search(msg)
+        if m is not None:
+            return LocatorAmbiguous(int(m.group(1)))
     return RuntimeEvalError(msg)
 
 
@@ -97,6 +131,12 @@ class PlaywrightEngineSession(EngineSession):
         page.on("response", self._on_response)
 
     async def _navigation_interceptor(self, route: Route) -> None:
+        """context.route handler: abort a top-level navigation to a blocked
+        literal IP / scheme. KNOWN GAP (verified 2026-09-09): Playwright's
+        Chromium network manager continues *redirected* requests itself
+        without constructing a route, so this handler is never invoked for a
+        redirect hop; a public URL that 302s to an internal literal IP is not
+        caught here. See specs/locator-auto-wait.md → "Redirect gap"."""
         request = route.request
         try:
             if request.is_navigation_request() and navigation_request_is_blocked(request.url):
@@ -180,21 +220,46 @@ class PlaywrightEngineSession(EngineSession):
         try:
             return await pw_loc.count()
         except PlaywrightError as exc:
-            if loc.strategy in ("css", "xpath"):
-                raise InvalidLocatorSyntax(loc.strategy, loc.value, getattr(exc, "message", str(exc)))
-            raise
+            raise _locator_error(exc, loc) from exc
 
-    async def _resolve_single(self, loc: Locator, timeout: int):
-        """Resolve to exactly one element: 0 -> ElementNotFound, >1 (no nth) -> LocatorAmbiguous."""
+    async def _resolve_single(
+        self, loc: Locator, timeout: int, *, state: Literal["attached", "visible"] = "attached"
+    ) -> tuple[PwLocator, int]:
+        """Resolve to exactly one element, waiting up to ``timeout`` for it to
+        reach ``state`` first (Playwright's actionability model: an element
+        that renders a few hundred milliseconds late is not a 404).
+
+        Returns ``(pw_loc, remaining_ms)``; callers pass ``remaining_ms`` to
+        the action so ``timeout`` stays one budget for wait plus action.
+        0 matches after the wait -> ElementNotFound (404, unchanged message);
+        >1 without nth -> LocatorAmbiguous (409); an element that exists but
+        never reached a non-``attached`` state -> ActionTimeout (409).
+        """
         pw_loc = self._resolve(loc)
-        if loc.options is not None and loc.options.nth is not None:
-            return pw_loc
-        count = await self._count(pw_loc, loc)
-        if count == 0:
-            raise ElementNotFound(loc.repr_str())
-        if count > 1:
-            raise LocatorAmbiguous(count)
-        return pw_loc
+        started = time.monotonic()
+        try:
+            await pw_loc.first.wait_for(state=state, timeout=timeout)
+        except PlaywrightTimeoutError as exc:
+            if state == "attached":
+                raise ElementNotFound(loc.repr_str()) from exc
+            count = await self._count(pw_loc, loc)
+            if count == 0:
+                raise ElementNotFound(loc.repr_str()) from exc
+            if count > 1 and (loc.options is None or loc.options.nth is None):
+                raise LocatorAmbiguous(count) from exc
+            raise ActionTimeout(
+                f"Timed out after {timeout}ms waiting for {loc.repr_str()} to be {state}."
+            ) from exc
+        except PlaywrightError as exc:
+            raise _locator_error(exc, loc) from exc
+        if loc.options is None or loc.options.nth is None:
+            count = await self._count(pw_loc, loc)
+            if count == 0:
+                raise ElementNotFound(loc.repr_str())
+            if count > 1:
+                raise LocatorAmbiguous(count)
+        remaining = max(1, timeout - int((time.monotonic() - started) * 1000))
+        return pw_loc, remaining
 
     # ---- navigate ----
 
@@ -244,33 +309,41 @@ class PlaywrightEngineSession(EngineSession):
     # ---- interaction ----
 
     async def click(self, locator: Locator, timeout: int) -> None:
-        pw_loc = await self._resolve_single(locator, timeout)
+        pw_loc, remaining = await self._resolve_single(locator, timeout)
         try:
-            await pw_loc.click(timeout=timeout)
+            await pw_loc.click(timeout=remaining)
+        except PlaywrightTimeoutError as exc:
+            raise _action_timeout(locator, timeout) from exc
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
 
     async def type(self, locator: Locator, text: str, clear: bool, timeout: int) -> None:
-        pw_loc = await self._resolve_single(locator, timeout)
+        pw_loc, remaining = await self._resolve_single(locator, timeout)
         try:
             if clear:
-                await pw_loc.fill(text, timeout=timeout)
+                await pw_loc.fill(text, timeout=remaining)
             else:
-                await pw_loc.press_sequentially(text, timeout=timeout)
+                await pw_loc.press_sequentially(text, timeout=remaining)
+        except PlaywrightTimeoutError as exc:
+            raise _action_timeout(locator, timeout) from exc
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
 
     async def select(self, locator: Locator, value: str, timeout: int) -> None:
-        pw_loc = await self._resolve_single(locator, timeout)
+        pw_loc, remaining = await self._resolve_single(locator, timeout)
         try:
-            await pw_loc.select_option(value, timeout=timeout)
+            await pw_loc.select_option(value, timeout=remaining)
+        except PlaywrightTimeoutError as exc:
+            raise _action_timeout(locator, timeout) from exc
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
 
     async def hover(self, locator: Locator, timeout: int) -> None:
-        pw_loc = await self._resolve_single(locator, timeout)
+        pw_loc, remaining = await self._resolve_single(locator, timeout)
         try:
-            await pw_loc.hover(timeout=timeout)
+            await pw_loc.hover(timeout=remaining)
+        except PlaywrightTimeoutError as exc:
+            raise _action_timeout(locator, timeout) from exc
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
 
@@ -279,14 +352,23 @@ class PlaywrightEngineSession(EngineSession):
             if locator is None:
                 await self._page.keyboard.press(key)
             else:
-                pw_loc = await self._resolve_single(locator, timeout)
-                await pw_loc.press(key, timeout=timeout)
+                pw_loc, remaining = await self._resolve_single(locator, timeout)
+                await pw_loc.press(key, timeout=remaining)
+        except PlaywrightTimeoutError as exc:
+            if locator is not None:
+                raise _action_timeout(locator, timeout) from exc
+            raise _classify_playwright_error(exc) from exc
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
 
     async def evaluate(self, expression: str, timeout: int) -> str:
         try:
-            result = await asyncio.wait_for(self._page.evaluate(expression), timeout=timeout / 1000)
+            # Settled retry (like localStorage): the caller's timeout still
+            # bounds the whole thing, retries included. Matches the platform
+            # service, whose /browser/evaluate also routes through the helper.
+            result = await asyncio.wait_for(
+                self._evaluate_settled(expression), timeout=timeout / 1000
+            )
         except (asyncio.TimeoutError, TimeoutError) as exc:
             raise ActionTimeout(f"Timed out after {timeout}ms running evaluate.") from exc
         except PlaywrightError as exc:
@@ -327,9 +409,14 @@ class PlaywrightEngineSession(EngineSession):
                 return await self._page.inner_text("body", timeout=timeout)
             except PlaywrightError as exc:
                 raise _classify_playwright_error(exc) from exc
-        pw_loc = await self._resolve_single(locator, timeout)
+        # get-text waits for *visible*: platform/playwright preceded it with
+        # wait_for_selector(visible), and text_content() on a hidden element
+        # would return text the platform never read.
+        pw_loc, remaining = await self._resolve_single(locator, timeout, state="visible")
         try:
-            text = await pw_loc.text_content(timeout=timeout)
+            text = await pw_loc.text_content(timeout=remaining)
+        except PlaywrightTimeoutError as exc:
+            raise _action_timeout(locator, timeout) from exc
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
         return text or ""
@@ -337,21 +424,31 @@ class PlaywrightEngineSession(EngineSession):
     async def get_html(self, locator: Locator | None, outer: bool, timeout: int) -> str:
         if locator is None:
             try:
-                return await self._page.evaluate("() => document.documentElement.outerHTML")
+                # Whole-document read right after a nav can hit the same
+                # hydration race; use the settled retry. (The `timeout` arg is
+                # not applied to this branch — as before this commit — the retry
+                # is self-bounded at ~1.5s.)
+                return await self._evaluate_settled(
+                    "() => document.documentElement.outerHTML"
+                )
             except PlaywrightError as exc:
                 raise _classify_playwright_error(exc) from exc
-        pw_loc = await self._resolve_single(locator, timeout)
+        pw_loc, remaining = await self._resolve_single(locator, timeout)
         try:
             if outer:
-                return await pw_loc.evaluate("el => el.outerHTML")
-            return await pw_loc.inner_html(timeout=timeout)
+                return await pw_loc.evaluate("el => el.outerHTML", timeout=remaining)
+            return await pw_loc.inner_html(timeout=remaining)
+        except PlaywrightTimeoutError as exc:
+            raise _action_timeout(locator, timeout) from exc
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
 
     async def get_attribute(self, locator: Locator, attribute: str, timeout: int) -> str:
-        pw_loc = await self._resolve_single(locator, timeout)
+        pw_loc, remaining = await self._resolve_single(locator, timeout)
         try:
-            value = await pw_loc.get_attribute(attribute, timeout=timeout)
+            value = await pw_loc.get_attribute(attribute, timeout=remaining)
+        except PlaywrightTimeoutError as exc:
+            raise _action_timeout(locator, timeout) from exc
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
         if value is None:
@@ -360,10 +457,7 @@ class PlaywrightEngineSession(EngineSession):
 
     async def find(self, locator: Locator) -> list[ElementInfo]:
         pw_loc = self._resolve(locator)
-        try:
-            count = await self._count(pw_loc, locator)
-        except PlaywrightError as exc:
-            raise _classify_playwright_error(exc, locator=locator) from exc
+        count = await self._count(pw_loc, locator)
         out: list[ElementInfo] = []
         for i in range(min(count, 50)):
             el = pw_loc.nth(i)
@@ -388,11 +482,11 @@ class PlaywrightEngineSession(EngineSession):
             if locator is None:
                 raw = await self._page.screenshot(type="png", full_page=full_page, timeout=timeout)
             else:
-                pw_loc = await self._resolve_single(locator, timeout)
-                raw = await pw_loc.screenshot(type="png", timeout=timeout)
+                pw_loc, remaining = await self._resolve_single(locator, timeout)
+                raw = await pw_loc.screenshot(type="png", timeout=remaining)
         except PlaywrightTimeoutError as exc:
             if locator is not None:
-                raise ActionTimeout(f"Timed out after {timeout}ms waiting for {locator.repr_str()}.") from exc
+                raise _action_timeout(locator, timeout) from exc
             raise ActionTimeout(f"Timed out after {timeout}ms taking a screenshot.") from exc
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc, locator=locator) from exc
@@ -469,27 +563,61 @@ class PlaywrightEngineSession(EngineSession):
             raise _classify_playwright_error(exc) from exc
         raise RuntimeEvalError(f"unsupported cookies action {action!r}")
 
+    async def _evaluate_settled(
+        self, expression: str, arg: Any = _NO_ARG, *, retries: int = 3
+    ) -> Any:
+        """``page.evaluate`` that survives the SPA hydration race.
+
+        An SPA's initial client-side router navigation destroys the JS
+        execution context; an evaluate that lands in that window dies with
+        "Execution context was destroyed, most likely because of a
+        navigation" even though the page is fine a moment later. It shows up
+        as a one-request flake when a caller seeds an auth token into
+        localStorage immediately after navigating (the set lands mid-hydration)
+        and surfaces to the client as a 422. Retry into the settled context
+        instead. Mirrors the platform playwright service's ``_evaluate_settled``
+        so the two runners behave identically for the e2e collections.
+
+        Only the "execution context was destroyed" navigation race is retried;
+        every other Playwright error propagates on the first attempt so real
+        failures are not masked or delayed.
+        """
+        for attempt in range(retries + 1):
+            try:
+                if arg is _NO_ARG:
+                    return await self._page.evaluate(expression)
+                return await self._page.evaluate(expression, arg)
+            except PlaywrightError as exc:
+                msg = getattr(exc, "message", None) or str(exc)
+                if "execution context was destroyed" not in msg.lower() or attempt == retries:
+                    raise
+                await asyncio.sleep(0.25 * (attempt + 1))
+        # Unreachable: the final iteration (attempt == retries) always returns on
+        # success or re-raises. Explicit guard so a future loop-bound edit can't
+        # silently fall through and return None.
+        raise RuntimeError("unreachable: _evaluate_settled retry loop exhausted")
+
     async def local_storage(self, action: str, key: str | None, value: str | None) -> str:
         try:
             if action == "get":
                 if key:
-                    result = await self._page.evaluate(
+                    result = await self._evaluate_settled(
                         "k => window.localStorage.getItem(k)", key
                     )
                     return result if result is not None else f"Key '{key}' not found."
-                return await self._page.evaluate(
+                return await self._evaluate_settled(
                     "() => JSON.stringify(Object.fromEntries(Object.entries(window.localStorage)))"
                 )
             if action == "set":
-                await self._page.evaluate(
+                await self._evaluate_settled(
                     "([k, v]) => window.localStorage.setItem(k, v)", [key, value]
                 )
                 return f"Set localStorage[{key!r}]."
             if action == "remove":
-                await self._page.evaluate("k => window.localStorage.removeItem(k)", key)
+                await self._evaluate_settled("k => window.localStorage.removeItem(k)", key)
                 return f"Removed localStorage[{key!r}]."
             if action == "clear":
-                await self._page.evaluate("() => window.localStorage.clear()")
+                await self._evaluate_settled("() => window.localStorage.clear()")
                 return "localStorage cleared."
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc) from exc
