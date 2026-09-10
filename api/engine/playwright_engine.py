@@ -363,7 +363,12 @@ class PlaywrightEngineSession(EngineSession):
 
     async def evaluate(self, expression: str, timeout: int) -> str:
         try:
-            result = await asyncio.wait_for(self._page.evaluate(expression), timeout=timeout / 1000)
+            # Settled retry (like localStorage): the caller's timeout still
+            # bounds the whole thing, retries included. Matches the platform
+            # service, whose /browser/evaluate also routes through the helper.
+            result = await asyncio.wait_for(
+                self._evaluate_settled(expression), timeout=timeout / 1000
+            )
         except (asyncio.TimeoutError, TimeoutError) as exc:
             raise ActionTimeout(f"Timed out after {timeout}ms running evaluate.") from exc
         except PlaywrightError as exc:
@@ -419,7 +424,11 @@ class PlaywrightEngineSession(EngineSession):
     async def get_html(self, locator: Locator | None, outer: bool, timeout: int) -> str:
         if locator is None:
             try:
-                return await self._page.evaluate("() => document.documentElement.outerHTML")
+                # Whole-document read right after a nav can hit the same
+                # hydration race; use the settled retry.
+                return await self._evaluate_settled(
+                    "() => document.documentElement.outerHTML"
+                )
             except PlaywrightError as exc:
                 raise _classify_playwright_error(exc) from exc
         pw_loc, remaining = await self._resolve_single(locator, timeout)
