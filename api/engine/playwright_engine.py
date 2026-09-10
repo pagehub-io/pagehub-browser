@@ -53,6 +53,9 @@ from api.ssrf import navigation_request_is_blocked
 
 logger = logging.getLogger(__name__)
 
+# Sentinel distinguishing "no evaluate arg" from an explicit ``None`` arg.
+_NO_ARG: Any = object()
+
 _CHROMIUM_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
 
 _FIND_ATTRS_JS = """el => {
@@ -549,27 +552,57 @@ class PlaywrightEngineSession(EngineSession):
             raise _classify_playwright_error(exc) from exc
         raise RuntimeEvalError(f"unsupported cookies action {action!r}")
 
+    async def _evaluate_settled(
+        self, expression: str, arg: Any = _NO_ARG, *, retries: int = 3
+    ) -> Any:
+        """``page.evaluate`` that survives the SPA hydration race.
+
+        An SPA's initial client-side router navigation destroys the JS
+        execution context; an evaluate that lands in that window dies with
+        "Execution context was destroyed, most likely because of a
+        navigation" even though the page is fine a moment later. It shows up
+        as a one-request flake when a caller seeds an auth token into
+        localStorage immediately after navigating (the set lands mid-hydration)
+        and surfaces to the client as a 422. Retry into the settled context
+        instead. Mirrors the platform playwright service's ``_evaluate_settled``
+        so the two runners behave identically for the e2e collections.
+
+        Only the "execution context was destroyed" navigation race is retried;
+        every other Playwright error propagates on the first attempt so real
+        failures are not masked or delayed.
+        """
+        for attempt in range(retries + 1):
+            try:
+                if arg is _NO_ARG:
+                    return await self._page.evaluate(expression)
+                return await self._page.evaluate(expression, arg)
+            except PlaywrightError as exc:
+                msg = getattr(exc, "message", None) or str(exc)
+                if "execution context was destroyed" not in msg.lower() or attempt == retries:
+                    raise
+                await asyncio.sleep(0.25 * (attempt + 1))
+
     async def local_storage(self, action: str, key: str | None, value: str | None) -> str:
         try:
             if action == "get":
                 if key:
-                    result = await self._page.evaluate(
+                    result = await self._evaluate_settled(
                         "k => window.localStorage.getItem(k)", key
                     )
                     return result if result is not None else f"Key '{key}' not found."
-                return await self._page.evaluate(
+                return await self._evaluate_settled(
                     "() => JSON.stringify(Object.fromEntries(Object.entries(window.localStorage)))"
                 )
             if action == "set":
-                await self._page.evaluate(
+                await self._evaluate_settled(
                     "([k, v]) => window.localStorage.setItem(k, v)", [key, value]
                 )
                 return f"Set localStorage[{key!r}]."
             if action == "remove":
-                await self._page.evaluate("k => window.localStorage.removeItem(k)", key)
+                await self._evaluate_settled("k => window.localStorage.removeItem(k)", key)
                 return f"Removed localStorage[{key!r}]."
             if action == "clear":
-                await self._page.evaluate("() => window.localStorage.clear()")
+                await self._evaluate_settled("() => window.localStorage.clear()")
                 return "localStorage cleared."
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc) from exc

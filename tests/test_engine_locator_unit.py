@@ -238,3 +238,76 @@ async def test_interceptor_continues_public_and_subresource_requests(monkeypatch
     sub = _FakeRoute("http://169.254.169.254/x.png", nav=False)
     await s._navigation_interceptor(sub)
     assert sub.continued and sub.aborted is None  # sub-resources are the documented residual
+
+
+# ---- _evaluate_settled (hydration-race retry) ----
+
+import api.engine.playwright_engine as _pe  # noqa: E402
+
+_CONTEXT_DESTROYED = PlaywrightError(
+    "Execution context was destroyed, most likely because of a navigation."
+)
+
+
+class _FakeEvalPage:
+    """A stand-in page whose evaluate() fails `fail_times` then returns `result`."""
+
+    def __init__(self, fail_times: int, exc: Exception, result: str = "ok") -> None:
+        self._fail_times = fail_times
+        self._exc = exc
+        self._result = result
+        self.calls: list[tuple] = []
+
+    async def evaluate(self, expression, *args):  # noqa: ANN001, ANN201
+        self.calls.append((expression, args))
+        if len(self.calls) <= self._fail_times:
+            raise self._exc
+        return self._result
+
+
+def _eval_session(page) -> PlaywrightEngineSession:
+    s = object.__new__(PlaywrightEngineSession)
+    s._page = page
+    return s
+
+
+async def _instant_sleep(_seconds):  # noqa: ANN001, ANN202
+    return None
+
+
+@pytest.mark.parametrize("fail_times", [0, 1, 3])
+async def test_evaluate_settled_retries_context_destroyed(fail_times, monkeypatch):
+    # The navigation race resolves within the retry budget → the caller sees success.
+    monkeypatch.setattr(_pe.asyncio, "sleep", _instant_sleep)
+    page = _FakeEvalPage(fail_times=fail_times, exc=_CONTEXT_DESTROYED, result="v")
+    out = await _eval_session(page)._evaluate_settled("expr", retries=3)
+    assert out == "v"
+    assert len(page.calls) == fail_times + 1
+
+
+async def test_evaluate_settled_gives_up_after_retries(monkeypatch):
+    # Persistent context-destroyed still surfaces (bounded), not a hang.
+    monkeypatch.setattr(_pe.asyncio, "sleep", _instant_sleep)
+    page = _FakeEvalPage(fail_times=99, exc=_CONTEXT_DESTROYED)
+    with pytest.raises(PlaywrightError, match="Execution context was destroyed"):
+        await _eval_session(page)._evaluate_settled("expr", retries=3)
+    assert len(page.calls) == 4  # first try + 3 retries
+
+
+async def test_evaluate_settled_does_not_retry_other_errors(monkeypatch):
+    # A real (non-race) error must propagate on the first attempt, never masked or delayed.
+    monkeypatch.setattr(_pe.asyncio, "sleep", _instant_sleep)
+    page = _FakeEvalPage(fail_times=99, exc=PlaywrightError("some other failure"))
+    with pytest.raises(PlaywrightError, match="some other failure"):
+        await _eval_session(page)._evaluate_settled("expr")
+    assert len(page.calls) == 1
+
+
+async def test_evaluate_settled_passes_arg_through(monkeypatch):
+    monkeypatch.setattr(_pe.asyncio, "sleep", _instant_sleep)
+    page = _FakeEvalPage(fail_times=0, exc=_CONTEXT_DESTROYED, result="x")
+    s = _eval_session(page)
+    await s._evaluate_settled("expr", ["k", "v"])
+    assert page.calls[0] == ("expr", (["k", "v"],))
+    await s._evaluate_settled("expr2")
+    assert page.calls[1] == ("expr2", ())  # no-arg form omits the evaluate arg
