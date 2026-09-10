@@ -311,3 +311,22 @@ async def test_evaluate_settled_passes_arg_through(monkeypatch):
     assert page.calls[0] == ("expr", (["k", "v"],))
     await s._evaluate_settled("expr2")
     assert page.calls[1] == ("expr2", ())  # no-arg form omits the evaluate arg
+
+
+async def test_evaluate_action_routes_through_settled(monkeypatch):
+    # Wiring guard: the general evaluate() must retry the hydration race (a
+    # silent revert to bare page.evaluate would drop the retry and this fails).
+    monkeypatch.setattr(_pe.asyncio, "sleep", _instant_sleep)
+    page = _FakeEvalPage(fail_times=1, exc=_CONTEXT_DESTROYED, result="v")
+    out = await _eval_session(page).evaluate("expr", timeout=5000)
+    assert out == "v"
+    assert len(page.calls) == 2  # first attempt raced, retry succeeded
+
+
+async def test_get_html_no_locator_routes_through_settled(monkeypatch):
+    # Wiring guard for the whole-document read path.
+    monkeypatch.setattr(_pe.asyncio, "sleep", _instant_sleep)
+    page = _FakeEvalPage(fail_times=1, exc=_CONTEXT_DESTROYED, result="<html>x</html>")
+    out = await _eval_session(page).get_html(locator=None, outer=True, timeout=5000)
+    assert out == "<html>x</html>"
+    assert len(page.calls) == 2

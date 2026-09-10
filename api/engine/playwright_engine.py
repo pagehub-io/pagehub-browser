@@ -425,7 +425,9 @@ class PlaywrightEngineSession(EngineSession):
         if locator is None:
             try:
                 # Whole-document read right after a nav can hit the same
-                # hydration race; use the settled retry.
+                # hydration race; use the settled retry. (The `timeout` arg is
+                # not applied to this branch — as before this commit — the retry
+                # is self-bounded at ~1.5s.)
                 return await self._evaluate_settled(
                     "() => document.documentElement.outerHTML"
                 )
