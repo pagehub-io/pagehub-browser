@@ -330,3 +330,28 @@ async def test_get_html_no_locator_routes_through_settled(monkeypatch):
     out = await _eval_session(page).get_html(locator=None, outer=True, timeout=5000)
     assert out == "<html>x</html>"
     assert len(page.calls) == 2
+
+
+class _HangingPage:
+    """evaluate() never completes — used to drive the outer wait_for deadline."""
+
+    async def evaluate(self, expression, *args):  # noqa: ANN001, ANN201
+        await asyncio.sleep(10)
+
+
+async def test_evaluate_persistent_race_surfaces_as_runtime_eval(monkeypatch):
+    # Long caller timeout: the retry budget is exhausted first, so a persistent
+    # hydration race surfaces as RuntimeEvalError (422), not a timeout — and does
+    # so through evaluate()'s wait_for wrapper.
+    monkeypatch.setattr(_pe.asyncio, "sleep", _instant_sleep)
+    page = _FakeEvalPage(fail_times=99, exc=_CONTEXT_DESTROYED)
+    with pytest.raises(RuntimeEvalError):
+        await _eval_session(page).evaluate("expr", timeout=5000)
+    assert len(page.calls) == 4  # 1 + 3 retries, then re-raised and classified
+
+
+async def test_evaluate_short_timeout_maps_to_action_timeout():
+    # When the caller timeout is shorter than the work, evaluate() surfaces
+    # ActionTimeout (409) via the outer wait_for — real sleep, no monkeypatch.
+    with pytest.raises(ActionTimeout):
+        await _eval_session(_HangingPage()).evaluate("expr", timeout=50)

@@ -592,6 +592,10 @@ class PlaywrightEngineSession(EngineSession):
                 if "execution context was destroyed" not in msg.lower() or attempt == retries:
                     raise
                 await asyncio.sleep(0.25 * (attempt + 1))
+        # Unreachable: the final iteration (attempt == retries) always returns on
+        # success or re-raises. Explicit guard so a future loop-bound edit can't
+        # silently fall through and return None.
+        raise AssertionError("unreachable: _evaluate_settled retry loop exhausted")
 
     async def local_storage(self, action: str, key: str | None, value: str | None) -> str:
         try:
