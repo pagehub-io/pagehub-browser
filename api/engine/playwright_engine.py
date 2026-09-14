@@ -52,6 +52,12 @@ logger = logging.getLogger(__name__)
 
 _CHROMIUM_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
 
+# Playwright raises this when a navigation destroys the JS execution context mid-
+# evaluate — e.g. an SPA client-side redirect firing right after a login page loads,
+# while we seed an auth token into localStorage. It's a transient: settle + retry.
+_CTX_DESTROYED = "Execution context was destroyed"
+_UNSET = object()
+
 _FIND_ATTRS_JS = """el => {
     const out = {};
     for (const a of ['id','class','href','src','data-testid','type','name','value','role','aria-label','alt','title']) {
@@ -85,8 +91,10 @@ def _classify_playwright_error(exc: PlaywrightError, *, locator: Locator | None 
 
 
 class PlaywrightEngineSession(EngineSession):
-    def __init__(self, engine: "PlaywrightEngine", context: BrowserContext, page: Page) -> None:
+    def __init__(self, engine: "PlaywrightEngine", browser: Browser,
+                 context: BrowserContext, page: Page) -> None:
         self._engine = engine
+        self._browser = browser
         self._context = context
         self._page = page
         self._console: deque[ConsoleLogEntry] = deque(maxlen=settings.max_log_entries)
@@ -469,27 +477,46 @@ class PlaywrightEngineSession(EngineSession):
             raise _classify_playwright_error(exc) from exc
         raise RuntimeEvalError(f"unsupported cookies action {action!r}")
 
+    async def _evaluate_settled(self, expr: str, arg: Any = _UNSET) -> Any:
+        """`page.evaluate`, tolerant of a concurrent navigation destroying the exec
+        context. An SPA client-side redirect right after load can kill the context
+        mid-evaluate (the classic failure when seeding an auth token into localStorage
+        on the login page). On that specific transient — and only it — wait for the
+        page to settle and retry ONCE; any other error propagates unchanged."""
+        for final in (False, True):
+            try:
+                if arg is _UNSET:
+                    return await self._page.evaluate(expr)
+                return await self._page.evaluate(expr, arg)
+            except PlaywrightError as exc:
+                if final or _CTX_DESTROYED not in str(getattr(exc, "message", exc)):
+                    raise
+                try:
+                    await self._page.wait_for_load_state("load", timeout=5000)
+                except PlaywrightError:
+                    pass  # settle best-effort; the retry itself is the real guard
+
     async def local_storage(self, action: str, key: str | None, value: str | None) -> str:
         try:
             if action == "get":
                 if key:
-                    result = await self._page.evaluate(
+                    result = await self._evaluate_settled(
                         "k => window.localStorage.getItem(k)", key
                     )
                     return result if result is not None else f"Key '{key}' not found."
-                return await self._page.evaluate(
+                return await self._evaluate_settled(
                     "() => JSON.stringify(Object.fromEntries(Object.entries(window.localStorage)))"
                 )
             if action == "set":
-                await self._page.evaluate(
+                await self._evaluate_settled(
                     "([k, v]) => window.localStorage.setItem(k, v)", [key, value]
                 )
                 return f"Set localStorage[{key!r}]."
             if action == "remove":
-                await self._page.evaluate("k => window.localStorage.removeItem(k)", key)
+                await self._evaluate_settled("k => window.localStorage.removeItem(k)", key)
                 return f"Removed localStorage[{key!r}]."
             if action == "clear":
-                await self._page.evaluate("() => window.localStorage.clear()")
+                await self._evaluate_settled("() => window.localStorage.clear()")
                 return "localStorage cleared."
         except PlaywrightError as exc:
             raise _classify_playwright_error(exc) from exc
@@ -505,8 +532,17 @@ class PlaywrightEngineSession(EngineSession):
         return url
 
     async def close(self) -> None:
+        # Close the context AND this session's own browser PROCESS. Chromium reclaims
+        # memory on process exit, NOT on context close, so closing the browser keeps the
+        # suite's memory flat (each session fully frees on close) — the shared-browser
+        # model leaked memory across contexts until an OOM-disconnect killed every live
+        # session at once (the flakiness this fix removes).
         try:
             await self._context.close()
+        except PlaywrightError:
+            pass
+        try:
+            await self._browser.close()
         except PlaywrightError:
             pass
 
@@ -514,32 +550,35 @@ class PlaywrightEngineSession(EngineSession):
 class PlaywrightEngine(Engine):
     def __init__(self) -> None:
         self._pw: Playwright | None = None
-        self._browser: Browser | None = None
         self._browser_restarts_total = 0
         self._launch_lock = asyncio.Lock()
 
-    async def _ensure_browser(self) -> Browser:
-        if self._browser is not None and self._browser.is_connected():
-            return self._browser
+    async def _ensure_pw(self) -> Playwright:
+        """Start Playwright once (lazily, on first session-create). Sessions each own a
+        dedicated chromium PROCESS launched off this — there is no shared browser."""
+        if self._pw is not None:
+            return self._pw
         async with self._launch_lock:
-            if self._browser is not None and self._browser.is_connected():
-                return self._browser
             if self._pw is None:
                 self._pw = await async_playwright().start()
-            self._browser = await self._pw.chromium.launch(
-                headless=settings.headless, args=_CHROMIUM_ARGS
-            )
-            self._browser.on("disconnected", self._on_disconnected)
-            return self._browser
+            return self._pw
 
     def _on_disconnected(self, _browser: Browser) -> None:
+        # A per-session chromium process died (crash/OOM of that ONE process). Counted
+        # for observability; it is isolated to its own session and never affects others.
         self._browser_restarts_total += 1
-        self._browser = None
-        logger.warning("shared chromium disconnected; will relaunch on next session-create")
+        logger.warning("per-session chromium disconnected")
 
     async def new_session(self, opts: SessionOpts) -> EngineSession:
+        # ONE dedicated chromium process per session (not a context on a shared
+        # browser). Memory is fully reclaimed when the session closes, and a crash is
+        # isolated to that session — the shared-browser model accumulated memory across
+        # contexts and, on an OOM-disconnect, killed every live session at once.
+        browser: Browser | None = None
         try:
-            browser = await self._ensure_browser()
+            pw = await self._ensure_pw()
+            browser = await pw.chromium.launch(headless=settings.headless, args=_CHROMIUM_ARGS)
+            browser.on("disconnected", self._on_disconnected)
             context_kwargs: dict[str, Any] = {
                 "viewport": {"width": opts.viewport_width, "height": opts.viewport_height},
             }
@@ -547,28 +586,32 @@ class PlaywrightEngine(Engine):
                 context_kwargs["user_agent"] = opts.user_agent
             context = await browser.new_context(**context_kwargs)
             page = await context.new_page()
-            session = PlaywrightEngineSession(self, context, page)
+            session = PlaywrightEngineSession(self, browser, context, page)
             await context.route("**/*", session._navigation_interceptor)
         except PlaywrightError as exc:
+            if browser is not None:
+                try:
+                    await browser.close()  # don't leak a launched process on a failed create
+                except PlaywrightError:
+                    pass
             raise EngineCrash(getattr(exc, "message", str(exc))) from exc
         return session
 
     def is_alive(self) -> bool:
-        return self._browser is not None and self._browser.is_connected()
+        # The engine can serve while Playwright is running; sessions own their own
+        # browsers, so there is no single shared browser whose death disables everything.
+        return self._pw is not None
 
     def browser_restarts_total(self) -> int:
         return self._browser_restarts_total
 
     async def close(self) -> None:
-        try:
-            if self._browser is not None:
-                await self._browser.close()
-        except PlaywrightError:
-            pass
+        # Engine teardown. Per-session browsers are owned by their sessions (closed on
+        # session close, or with the process on shutdown); stopping Playwright is the
+        # only engine-level teardown left.
         try:
             if self._pw is not None:
                 await self._pw.stop()
         except PlaywrightError:
             pass
-        self._browser = None
         self._pw = None
