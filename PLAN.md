@@ -492,3 +492,31 @@ LOG_LEVEL=INFO
 
 ### Open (need user input)
 - None. Everything above is decided. The standing accept-or-reject items for Gavin remain as the Security section lists them (`--no-sandbox` residual; the `evaluate`+`fetch`-to-internal-IP residual; no per-caller auth/rate-limiting in v1; the Modal-token-on-a-public-repo option; the `pagehub-browser_url` env-var set in pagehub-evals) — those are sign-offs, not unresolved conflicts.
+
+---
+
+## UPDATE (2026-09-14) — per-session browser processes (supersedes the shared-browser model above)
+
+The engine no longer holds one shared `Browser` with a `BrowserContext` per session.
+**Each session now owns its own Chromium *process*** (`PlaywrightEngine.new_session`
+launches it; `session.close()` closes it). Rationale + trade-offs, correcting the
+shared-browser assumptions in the sections above:
+
+- **Why:** Chromium reclaims memory on *process* exit, not context close, so the
+  shared browser's RSS grew across create/close cycles until an OOM-disconnect took
+  out **every** live session at once. Per-session processes free memory on close and
+  isolate a crash to one session.
+- **Memory sizing (corrects §Security "MAX_SESSIONS × ~150 MB").** Peak is now up to
+  `MAX_SESSIONS` **independent Chromium processes**, whose per-process base is higher
+  than the old per-context figure. Still hard-bounded by `MAX_SESSIONS` (20) — revisit
+  the Modal memory tier against a per-process measurement, not the per-context 150 MB.
+- **`is_alive()`** now means "Playwright is running" (there is no shared browser to
+  check); the reaper's mass-drop-on-`is_alive()==False` branch is effectively inert for
+  this engine (a single session's browser death is isolated, surfaced on that session's
+  next action). A dead session pins a capacity slot until idle-reaped — accepted as
+  crash isolation.
+- **`browser_restarts_total`** counts **unexpected** per-session Chromium disconnects
+  (OOM/crash of one process) — intentional `browser.close()` on session close / failed
+  create is tracked and excluded, so the metric stays a true crash/OOM oncall signal.
+  (Oncall reading, §Ops line 200: `browser_restarts_total` climbing still means Chromium
+  processes are crashing/OOM-cycling — now per session, not one shared browser.)

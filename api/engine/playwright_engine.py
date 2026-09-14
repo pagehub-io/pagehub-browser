@@ -542,6 +542,10 @@ class PlaywrightEngineSession(EngineSession):
         except PlaywrightError:
             pass
         try:
+            # Mark BEFORE closing so the disconnected listener doesn't count this
+            # intentional teardown as a crash (else browser_restarts_total climbs on
+            # every healthy session close — review I-1).
+            self._engine._note_intentional_close(self._browser)
             await self._browser.close()
         except PlaywrightError:
             pass
@@ -552,6 +556,12 @@ class PlaywrightEngine(Engine):
         self._pw: Playwright | None = None
         self._browser_restarts_total = 0
         self._launch_lock = asyncio.Lock()
+        # ids of per-session browsers we are closing on purpose (session close / failed
+        # create), so `_on_disconnected` counts only UNEXPECTED crashes (review I-1).
+        self._intentional_closes: set[int] = set()
+
+    def _note_intentional_close(self, browser: Browser) -> None:
+        self._intentional_closes.add(id(browser))
 
     async def _ensure_pw(self) -> Playwright:
         """Start Playwright once (lazily, on first session-create). Sessions each own a
@@ -563,11 +573,16 @@ class PlaywrightEngine(Engine):
                 self._pw = await async_playwright().start()
             return self._pw
 
-    def _on_disconnected(self, _browser: Browser) -> None:
-        # A per-session chromium process died (crash/OOM of that ONE process). Counted
-        # for observability; it is isolated to its own session and never affects others.
+    def _on_disconnected(self, browser: Browser) -> None:
+        # Fires on BOTH an unexpected crash and our own browser.close(). Skip the ones we
+        # closed on purpose so browser_restarts_total stays a true crash/OOM signal
+        # (review I-1); only an UNEXPECTED disconnect (crash/OOM of that one process,
+        # isolated to its own session) is counted.
+        if id(browser) in self._intentional_closes:
+            self._intentional_closes.discard(id(browser))
+            return
         self._browser_restarts_total += 1
-        logger.warning("per-session chromium disconnected")
+        logger.warning("per-session chromium disconnected unexpectedly")
 
     async def new_session(self, opts: SessionOpts) -> EngineSession:
         # ONE dedicated chromium process per session (not a context on a shared
@@ -591,6 +606,7 @@ class PlaywrightEngine(Engine):
         except PlaywrightError as exc:
             if browser is not None:
                 try:
+                    self._note_intentional_close(browser)  # not a crash — don't count (I-1)
                     await browser.close()  # don't leak a launched process on a failed create
                 except PlaywrightError:
                     pass

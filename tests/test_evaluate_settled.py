@@ -63,3 +63,12 @@ async def test_localstorage_set_gives_up_after_one_retry():
     with pytest.raises(EngineError):
         await session.local_storage("set", "k", "v")
     assert page.calls == 2  # one retry only, then propagate
+
+
+@pytest.mark.asyncio
+async def test_localstorage_get_all_uses_no_arg_path_and_retries():
+    """The no-arg (_UNSET) evaluate path (get-all) also settles + retries once."""
+    page = _FakePage(fail_times=1, error_msg="Execution context was destroyed, most likely because of a navigation.")
+    session = _session(page)
+    await session.local_storage("get", None, None)  # get-all → no-arg evaluate
+    assert page.calls == 2 and page.load_waits == 1

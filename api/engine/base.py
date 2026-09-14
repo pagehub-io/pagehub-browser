@@ -175,10 +175,13 @@ class Engine(abc.ABC):
 
     @abc.abstractmethod
     def is_alive(self) -> bool:
-        """True iff the shared browser (if any) is launched and still connected.
+        """True iff the engine can serve session creates.
 
-        The SessionManager uses this to detect a shared-browser death; the reaper's
-        self-correcting sweep drops all records when this returns False.
+        Sessions each own their OWN browser process (no shared browser), so a single
+        session's browser dying does NOT disable the engine — it is isolated to that
+        session, whose next action then errors and drops the record. The reaper's
+        mass-drop sweep (gated on this) is therefore effectively inert for the
+        Playwright engine and stays only as a fake-engine test seam.
         """
 
     @abc.abstractmethod
