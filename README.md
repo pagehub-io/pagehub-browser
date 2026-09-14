@@ -113,10 +113,13 @@ every closed session id (full ids are never logged).
   `POST /v1/admin/reset-sessions` (see below).
 - **SSRF.** `navigate` to a non-http(s) scheme, a malformed URL, or a loopback / RFC1918 /
   link-local-or-metadata host → `400 "Refused to navigate to '<url>': <reason>."` A
-  committed `context.route` interceptor also aborts redirects to literal internal IPs (no
-  DNS in the hot path). **Residual (v1):** `fetch()` from `evaluate` to an internal IP is
-  *not* blocked — the interceptor gates navigations only; the configurable per-deploy
-  allowlist is the follow-up fix. Don't put this service behind a domain that implies it's
+  committed `context.route` interceptor also aborts *top-level* navigations to literal
+  internal IPs (no DNS in the hot path). **Residuals (v1):** (a) a public URL that 302s to
+  an internal IP is **not** blocked — Playwright continues redirected requests without
+  routing them, so the interceptor never sees a redirect hop (see
+  `specs/locator-auto-wait.md`, "Redirect gap"; tracked in #5); (b) `fetch()` from
+  `evaluate` to an internal IP is *not* blocked — the interceptor gates navigations only.
+  The configurable per-deploy allowlist is the follow-up fix for both. Don't put this service behind a domain that implies it's
   trustworthy: it is unauthenticated and SSRF-capable by design. **Dev escape hatch:**
   `BROWSER_ALLOW_PRIVATE_HOSTS=true` relaxes the host deny-list (not the scheme allowlist),
   but *only* when `ENV=development` — deny-by-default everywhere else.

@@ -148,7 +148,10 @@ def check_navigate_url(url: str) -> None:
 def navigation_request_is_blocked(url: str) -> bool:
     """Literal-IP / scheme check for the in-page navigation interceptor — NO DNS.
 
-    Used by PlaywrightEngine's context.route handler on redirect targets in the hot path.
+    Used by PlaywrightEngine's context.route handler for top-level navigation requests.
+    NOTE: it does not see redirect hops; Playwright continues redirected requests without
+    routing them (verified 2026-09-09), so the redirect-to-internal-IP case documented in
+    PLAN.md as closed is open. Tracked in #5 (needs its own security-reviewed plan).
     """
     try:
         parts = urlsplit(url)

@@ -64,7 +64,10 @@ class NavigationError(EngineError):
 
 
 class BlockedNavigation(EngineError):
-    """The committed context.route interceptor aborted a navigation to a blocked host/scheme."""
+    """The context.route interceptor aborted a top-level navigation to a blocked host/scheme.
+
+    Not raised for redirect hops: Playwright does not route redirected requests, so the
+    interceptor never sees them (verified 2026-09-09; open follow-up)."""
 
     def __init__(self, url: str) -> None:
         self.url = url
