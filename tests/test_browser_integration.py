@@ -194,3 +194,22 @@ def test_idle_reaper_real(real_client):
     assert r.status_code == 404
     assert "expired" in r.json()["detail"]
     assert c.get("/metrics").json()["sessions_reaped_total"] >= 1
+
+
+@pytest.mark.browser
+@pytest.mark.asyncio
+async def test_browser_restarts_total_zero_after_healthy_closes():
+    """Review I-1 regression guard: browser_restarts_total is a crash/OOM signal, so a
+    HEALTHY session close (which now calls browser.close() → fires 'disconnected') must
+    NOT increment it. Only an unexpected disconnect counts."""
+    from api.engine.base import SessionOpts
+    from api.engine.playwright_engine import PlaywrightEngine
+
+    engine = PlaywrightEngine()
+    try:
+        for _ in range(3):
+            session = await engine.new_session(SessionOpts())
+            await session.close()
+        assert engine.browser_restarts_total() == 0
+    finally:
+        await engine.close()
