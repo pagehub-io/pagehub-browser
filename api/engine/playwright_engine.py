@@ -696,6 +696,7 @@ class PlaywrightEngine(Engine):
         # isolated to that session — the shared-browser model accumulated memory across
         # contexts and, on an OOM-disconnect, killed every live session at once.
         browser: Browser | None = None
+        owned = False  # flips True once the browser is handed to the returned session
         try:
             pw = await self._ensure_pw()
             browser = await pw.chromium.launch(headless=settings.headless, args=_CHROMIUM_ARGS)
@@ -709,15 +710,25 @@ class PlaywrightEngine(Engine):
             page = await context.new_page()
             session = PlaywrightEngineSession(self, browser, context, page)
             await context.route("**/*", session._navigation_interceptor)
+            owned = True
+            return session
         except PlaywrightError as exc:
-            if browser is not None:
+            raise EngineCrash(getattr(exc, "message", str(exc))) from exc
+        finally:
+            # Reap a launched-but-not-returned chromium PROCESS on ANY failure between
+            # launch() and handing ownership to the session — a PlaywrightError, OR a
+            # non-PlaywrightError (asyncio.CancelledError from a client disconnect /
+            # shutdown, MemoryError under the very OOM conditions this per-session model
+            # exists to bound). Catching only PlaywrightError here would leak exactly one
+            # chromium process per such occurrence, undoing the memory fix (review I-A).
+            # Marked intentional first so the close's 'disconnected' isn't miscounted as a
+            # crash (review I-1).
+            if browser is not None and not owned:
+                self._note_intentional_close(browser)
                 try:
-                    self._note_intentional_close(browser)  # not a crash — don't count (I-1)
-                    await browser.close()  # don't leak a launched process on a failed create
+                    await browser.close()
                 except PlaywrightError:
                     pass
-            raise EngineCrash(getattr(exc, "message", str(exc))) from exc
-        return session
 
     def is_alive(self) -> bool:
         # The engine can serve while Playwright is running; sessions own their own
