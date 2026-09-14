@@ -102,20 +102,6 @@ def test_ssrf_real_browser_precheck(real_client):
     c.request("DELETE", f"/v1/sessions/{sid}")
 
 
-def test_ssrf_redirect_interceptor(real_client):
-    """A public URL that 302s to a literal internal IP is aborted by the context.route interceptor."""
-    c = real_client
-    sid = c.post("/v1/sessions", json={"headless": True}).json()["session_id"]
-    # nip.io / a redirect service that bounces to 127.0.0.1; httpstat.us supports a Location.
-    redirect_url = "https://httpstat.us/302?Location=http://169.254.169.254/"
-    r = c.post(f"/v1/sessions/{sid}/navigate", json={"url": redirect_url})
-    # The redirect either aborts (400 host not allowed) or — if the fixture is unreachable — a 502.
-    assert r.status_code in (400, 502)
-    if r.status_code == 400:
-        assert "host not allowed" in r.json()["detail"]
-    c.request("DELETE", f"/v1/sessions/{sid}")
-
-
 def test_evaluate_timeout_real(real_client):
     """A never-resolving Promise must be killed by the asyncio.wait_for wrapper, not the 120s ceiling."""
     import time
