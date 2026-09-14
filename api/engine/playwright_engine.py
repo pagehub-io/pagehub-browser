@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import weakref
 from collections import deque
 from typing import Any
 
@@ -556,12 +557,14 @@ class PlaywrightEngine(Engine):
         self._pw: Playwright | None = None
         self._browser_restarts_total = 0
         self._launch_lock = asyncio.Lock()
-        # ids of per-session browsers we are closing on purpose (session close / failed
-        # create), so `_on_disconnected` counts only UNEXPECTED crashes (review I-1).
-        self._intentional_closes: set[int] = set()
+        # Per-session browsers we are closing on purpose (session close / failed
+        # create), so `_on_disconnected` counts only UNEXPECTED crashes (review I-1). A
+        # WeakSet auto-drops a browser once it is GC'd — no stale entry if a browser
+        # dies before we mark it, and immune to id() reuse (review nit-1).
+        self._intentional_closes: weakref.WeakSet[Browser] = weakref.WeakSet()
 
     def _note_intentional_close(self, browser: Browser) -> None:
-        self._intentional_closes.add(id(browser))
+        self._intentional_closes.add(browser)
 
     async def _ensure_pw(self) -> Playwright:
         """Start Playwright once (lazily, on first session-create). Sessions each own a
@@ -578,8 +581,8 @@ class PlaywrightEngine(Engine):
         # closed on purpose so browser_restarts_total stays a true crash/OOM signal
         # (review I-1); only an UNEXPECTED disconnect (crash/OOM of that one process,
         # isolated to its own session) is counted.
-        if id(browser) in self._intentional_closes:
-            self._intentional_closes.discard(id(browser))
+        if browser in self._intentional_closes:
+            self._intentional_closes.discard(browser)
             return
         self._browser_restarts_total += 1
         logger.warning("per-session chromium disconnected unexpectedly")

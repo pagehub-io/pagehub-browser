@@ -179,14 +179,17 @@ class Engine(abc.ABC):
 
         Sessions each own their OWN browser process (no shared browser), so a single
         session's browser dying does NOT disable the engine — it is isolated to that
-        session, whose next action then errors and drops the record. The reaper's
-        mass-drop sweep (gated on this) is therefore effectively inert for the
-        Playwright engine and stays only as a fake-engine test seam.
+        session, whose next action then errors (the record stays, pinning a capacity
+        slot until the idle reaper reclaims it). The reaper's mass-drop sweep (gated on
+        this) is therefore effectively inert for the Playwright engine and stays only as
+        a fake-engine test seam.
         """
 
     @abc.abstractmethod
     def browser_restarts_total(self) -> int:
-        """Count of detected shared-Browser deaths (browser.on('disconnected') firings)."""
+        """Count of UNEXPECTED per-session browser deaths (crash/OOM `disconnected`
+        firings). Intentional closes (session close / failed create) are excluded, so
+        this stays a true crash/OOM oncall signal."""
 
     @abc.abstractmethod
     async def close(self) -> None: ...
