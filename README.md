@@ -65,6 +65,11 @@ use `css`/`xpath` only when nothing else works.
 `find` returns at most 50 elements; full-page screenshots of large pages produce large
 JSON responses (`image` is a `data:image/png;base64,…` data URI).
 
+`console-logs` entries carry the console message `type` (`log`, `error`, `warning`, …), plus
+`pageerror` for uncaught exceptions and unhandled promise rejections, from the page and any
+frame in it (sandboxed and cross-origin iframes included). Those never reach the console
+event, so asserting "zero entries" is what catches a script that crashed.
+
 ### Service
 
 `GET /health` → `{status, commit, engine, env, live_sessions}` (`commit` is the running

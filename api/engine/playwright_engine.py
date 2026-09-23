@@ -130,6 +130,7 @@ class PlaywrightEngineSession(EngineSession):
         self._network: deque[NetworkLogEntry] = deque(maxlen=settings.max_log_entries)
         self._last_blocked_nav: str | None = None
         page.on("console", self._on_console)
+        page.on("pageerror", self._on_pageerror)
         page.on("request", self._on_request)
         page.on("response", self._on_response)
 
@@ -159,6 +160,16 @@ class PlaywrightEngineSession(EngineSession):
         if loc.get("url"):
             location = f"{loc.get('url', '')}:{loc.get('lineNumber', '')}"
         self._console.append(ConsoleLogEntry(type=msg.type, text=msg.text, location=location))
+
+    def _on_pageerror(self, error: PlaywrightError) -> None:
+        """Uncaught exceptions and unhandled promise rejections, from the page and every frame
+        in it (sandboxed and cross-origin iframes included). They never reach the `console`
+        event, so without this an eval asserting "no console entries" passes on a page whose
+        script crashed. Recorded in the same buffer as type "pageerror"."""
+        name = getattr(error, "name", None) or ""
+        message = getattr(error, "message", None) or str(error)
+        text = f"{name}: {message}" if name and not message.startswith(f"{name}:") else message
+        self._console.append(ConsoleLogEntry(type="pageerror", text=text, location=None))
 
     def _on_request(self, request: Request) -> None:
         self._network.append(
