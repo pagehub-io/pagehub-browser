@@ -213,3 +213,38 @@ async def test_browser_restarts_total_zero_after_healthy_closes():
         assert engine.browser_restarts_total() == 0
     finally:
         await engine.close()
+
+
+def test_pageerror_recorded_from_page_and_sandboxed_iframe_real(real_client):
+    """Uncaught exceptions and unhandled rejections reach console-logs as type "pageerror",
+    including one thrown inside a sandboxed (opaque-origin) iframe the page can't script."""
+    import time
+
+    c = real_client
+    sid = c.post("/v1/sessions", json={"headless": True}).json()["session_id"]
+    assert c.post(f"/v1/sessions/{sid}/navigate", json={"url": "https://example.com"}).status_code == 200
+    r = c.post(
+        f"/v1/sessions/{sid}/evaluate",
+        json={
+            "expression": (
+                "setTimeout(() => { throw new Error('top-level-boom') }, 0);"
+                "Promise.reject(new Error('top-level-rejection'));"
+                "const f = document.createElement('iframe'); f.setAttribute('sandbox', 'allow-scripts');"
+                "f.srcdoc = \"<script>setTimeout(() => { throw new Error('frame-boom') }, 0)<\\/script>\";"
+                "document.body.append(f); 'ok'"
+            )
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    texts: list[str] = []
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        entries = c.get(f"/v1/sessions/{sid}/console-logs").json()["entries"]
+        texts = [e["text"] for e in entries if e["type"] == "pageerror"]
+        if len(texts) >= 3:
+            break
+        time.sleep(0.2)
+    for needle in ("top-level-boom", "top-level-rejection", "frame-boom"):
+        assert any(needle in t for t in texts), (needle, texts)
+    c.delete(f"/v1/sessions/{sid}")
