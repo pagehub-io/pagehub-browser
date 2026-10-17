@@ -12,6 +12,9 @@ services:
     environment:
       # .env keeps ENV=development for local dev; any deployed compose MUST override this.
       ENV: ${ENV:-development}
+      # Stamped by `make up`. Set here as well as the build arg because .env also
+      # sets GIT_COMMIT, and an env_file value overrides the image's ENV.
+      GIT_COMMIT: ${GIT_COMMIT:-local-dev}
     # So `navigate` to http://host.docker.internal:<port>/ reaches a target frontend running
     # on the host (paired with BROWSER_ALLOW_PRIVATE_HOSTS=true in .env — dev only).
     extra_hosts:
