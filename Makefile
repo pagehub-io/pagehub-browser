@@ -4,8 +4,9 @@ install:
 	pip install -e ".[dev]"
 	playwright install --with-deps chromium
 
+# GIT_COMMIT: the checkout's HEAD, which /health reports as commit.
 up:
-	docker-compose up -d --build
+	GIT_COMMIT=$$(git rev-parse HEAD) docker-compose up -d --build
 
 down:
 	docker-compose down
