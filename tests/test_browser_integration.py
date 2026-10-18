@@ -5,9 +5,17 @@ Run with `make test-browser` (CI installs Playwright + Chromium); skipped otherw
 
 from __future__ import annotations
 
+import functools
+import threading
+from collections.abc import Iterator
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
 import pytest
 
 pytestmark = pytest.mark.browser
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
 @pytest.fixture
@@ -36,11 +44,41 @@ def real_client(monkeypatch):
         yield c
 
 
-def test_full_flow_real_browser(real_client):
+class _QuietFixtureHandler(SimpleHTTPRequestHandler):
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+@pytest.fixture
+def fixture_base_url(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    """Serve tests/fixtures/ on a loopback port for one test and yield its base URL.
+
+    Chromium runs on this same host (PlaywrightEngine launches it locally), so the loopback
+    address is reachable from the browser. navigate refuses loopback hosts unless the dev
+    escape hatch is on (ENV=development AND BROWSER_ALLOW_PRIVATE_HOSTS=true), so both are
+    pinned here; monkeypatch restores them after the test.
+    """
+    from api.config import settings
+
+    monkeypatch.setattr(settings, "env", "development")
+    monkeypatch.setattr(settings, "browser_allow_private_hosts", True)
+
+    handler = functools.partial(_QuietFixtureHandler, directory=str(FIXTURES_DIR))
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_full_flow_real_browser(real_client, fixture_base_url):
     c = real_client
+    page = f"{fixture_base_url}/integration_page.html"
     sid = c.post("/v1/sessions", json={"headless": True}).json()["session_id"]
 
-    r = c.post(f"/v1/sessions/{sid}/navigate", json={"url": "https://example.com"})
+    r = c.post(f"/v1/sessions/{sid}/navigate", json={"url": page})
     assert r.status_code == 200, r.text
     assert r.json()["status"] == 200
 
@@ -48,14 +86,14 @@ def test_full_flow_real_browser(real_client):
     assert r.status_code == 200
     assert "Example" in r.json()["text"]
 
-    # example.com has exactly one link; nth:0 disambiguates regardless of its label.
+    # The fixture page has exactly one link; nth:0 disambiguates regardless of its label.
     r = c.post(
         f"/v1/sessions/{sid}/click",
         json={"locator": {"strategy": "role", "value": "link", "options": {"nth": 0}}},
     )
     assert r.status_code == 200
 
-    r = c.post(f"/v1/sessions/{sid}/navigate", json={"url": "https://example.com"})
+    r = c.post(f"/v1/sessions/{sid}/navigate", json={"url": page})
     assert r.status_code == 200
 
     r = c.post(f"/v1/sessions/{sid}/screenshot", json={})
@@ -68,8 +106,8 @@ def test_full_flow_real_browser(real_client):
 
     # ambiguous read primitive -> 409; no-match -> 404
     r = c.post(f"/v1/sessions/{sid}/get-text", json={"locator": {"strategy": "css", "value": "a"}})
-    # example.com has exactly one link, so this is fine; use a broader locator for the ambiguous case
-    r = c.post(f"/v1/sessions/{sid}/navigate", json={"url": "https://example.com"})
+    # The fixture page has exactly one link, so this is fine; use a broader locator for the ambiguous case
+    r = c.post(f"/v1/sessions/{sid}/navigate", json={"url": page})
     r_amb = c.post(f"/v1/sessions/{sid}/get-text", json={"locator": {"strategy": "css", "value": "*"}})
     assert r_amb.status_code == 409
     r_404 = c.post(
@@ -88,7 +126,7 @@ def test_full_flow_real_browser(real_client):
     assert "Action failed" in r.json()["detail"]
 
     assert c.request("DELETE", f"/v1/sessions/{sid}").status_code == 204
-    r = c.post(f"/v1/sessions/{sid}/navigate", json={"url": "https://example.com"})
+    r = c.post(f"/v1/sessions/{sid}/navigate", json={"url": page})
     assert r.status_code == 404
     assert "Unknown session" in r.json()["detail"]
 

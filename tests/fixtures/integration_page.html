@@ -1,0 +1,20 @@
+<!doctype html>
+<!--
+  Local page for tests/test_browser_integration.py::test_full_flow_real_browser (pagehub-browser#14).
+  It replaces a live fetch of https://example.com, which no longer serves a heading or a link.
+  It keeps what the test asserts on: a title and a single level-1 heading containing "Example",
+  exactly one link, and body text. The link targets an anchor on this page, so clicking it
+  never leaves the local fixture server.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Example Domain</title>
+  </head>
+  <body>
+    <h1>Example Domain</h1>
+    <p>This page is served locally by the browser-integration test and does not depend on any third-party site.</p>
+    <p><a href="#more-information">More information...</a></p>
+    <p id="more-information">The link above only moves within this page.</p>
+  </body>
+</html>
