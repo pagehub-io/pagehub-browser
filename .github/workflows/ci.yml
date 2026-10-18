@@ -1,15 +1,21 @@
 name: ci
 
+# A pull request's CI starts when the review script adds the `0C/0I` label, not on every push,
+# and runs once on the reviewed commit (skill-sdlc "CI runs after review", Gavin 13 Oct 2026).
+# Each job skips a pull_request event unless it is the `0C/0I` label; push and dispatch are not gated.
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
+    types: [labeled]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   lint-and-unit:
+    if: github.event_name != 'pull_request' || github.event.label.name == '0C/0I'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,6 +27,7 @@ jobs:
       - run: pytest -m "not browser"
 
   browser-integration:
+    if: github.event_name != 'pull_request' || github.event.label.name == '0C/0I'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
