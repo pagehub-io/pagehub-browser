@@ -60,14 +60,18 @@ lock can't be had. Once it holds the lock:
   request, so a client disconnect can't cancel it. Only shutdown cancels it.
   `PlaywrightEngineSession.close()` already marks the browser intentional
   before closing it, so `browser_restarts_total` stays a crash signal.
-- **`close_all()` at shutdown** first waits for the pending closes with
-  `asyncio.wait(self._pending_closes, timeout=5)`. It then cancels every task
-  still pending and awaits them with
+- **`close_all()` at shutdown** takes `pending = set(self._pending_closes)`.
+  Only if `pending` is non-empty does it wait, with
+  `asyncio.wait(pending, timeout=5)`: `asyncio.wait` raises `ValueError` on an
+  empty set, and lifespan suppresses that, so an unguarded call would skip the
+  live records on every ordinary shutdown. It then cancels every task still
+  pending and awaits them with
   `asyncio.gather(*stragglers, return_exceptions=True)`, so none is still
-  running when Playwright stops under it. Then it closes the remaining live
-  records as today. The 5 s bound leaves room inside docker's default 10 s
-  stop grace period for the live records and `engine.close()`. Lifespan
-  teardown order is unchanged: reaper, then `close_all`, then `engine.close()`.
+  running when Playwright stops under it. Then, whether or not any close was
+  pending, it closes the remaining live records as today. The 5 s bound
+  leaves room inside docker's default 10 s stop grace period for the live
+  records and `engine.close()`. Lifespan teardown order is unchanged: reaper,
+  then `close_all`, then `engine.close()`.
 
 **Every lock holder rechecks.** A request that passed `get()` and then waited
 on `rec.lock` may get the lock after a DELETE has popped the record and
@@ -80,18 +84,27 @@ that acquires `rec.lock` calls it right after acquiring:
 
 - **The action runner** (`_run_action`, `api/v1/sessions/actions/router.py`).
   If the record isn't live, it releases the lock and raises
-  `SessionGone(session_id, expired=False)`, the generic unknown-404. That
-  happens before `actions_total` is incremented and before the engine verb
-  runs.
+  `session_gone_http(SessionGone(session_id, expired=False))`, the generic
+  unknown-404. It must raise the mapped `HTTPException`, not a bare
+  `SessionGone`: no global exception handler maps `SessionGone`, so a bare one
+  would be a 500. That happens before `actions_total` is incremented and
+  before the engine verb runs.
 - **The status probe** (`GET /v1/sessions/{id}`). Inside `async with rec.lock`,
-  if the record isn't live, it raises the same generic unknown-404, and the
-  `with` releases the lock.
+  if the record isn't live, it raises the same
+  `session_gone_http(SessionGone(session_id, expired=False))`, and the `with`
+  releases the lock. The probe can queue: `rec.lock.locked()` is false right
+  after a release, before the woken waiter runs, so a probe that passes its
+  `locked()` check then waits behind that waiter.
 - **`delete()`** itself, as step 1 above.
 
-The reaper and `_evict_one` set `rec.closing` before their close, so the
-recheck also turns away a request queued behind them. The reaper takes only a
-lock it has just seen free, and `_evict_one` takes none, so neither needs the
-recheck itself.
+The recheck covers a request queued behind a DELETE or an eviction.
+`_evict_one` sets `rec.closing` and takes no lock, so a request that gets the
+lock after it finds the record closing and gets the 404. The reaper holds
+`rec.lock` and never releases it (`api/session_manager.py:309`), so a request
+queued behind the reaper still gets the 409 at the lock timeout, as today.
+Only one woken just ahead of the reaper's acquire reaches the recheck. The
+reaper takes only a lock it has just seen free, and `_evict_one` takes none,
+so neither needs the recheck itself.
 
 The reaper's idle reap and the create path's LRU eviction (`_evict_one`) stay
 synchronous. They aren't on a client's DELETE path, and the evict path's
@@ -213,6 +226,9 @@ block on an `asyncio.Event`:
 8. `close_all()` awaits pending closes. When a close never finishes, it
    returns after the bound (short, injected for the test), and the straggler
    task has been cancelled and is done before the live records are closed.
+   **With no close pending**, `close_all()` on two live records closes both
+   engine sessions and leaves `_records` empty. That catches an unguarded
+   `asyncio.wait` on the empty set.
 9. A close that raises is logged, and leaves `closes_pending` at 0.
 10. `/metrics` has `closes_pending`. Update the exact-field-set test,
     `tests/test_routes.py::test_metrics_full_field_set_and_counters`.
@@ -234,6 +250,13 @@ block on an `asyncio.Event`:
     first action. The DELETE returns 204. The second action returns
     `404 "Unknown session"`, its engine verb isn't called, and
     `actions_total` counts only the first action.
+    **The probe variant.** The test holds `rec.lock` itself and starts a
+    DELETE, which queues on it. It releases the lock and, with no await in
+    between, awaits `get_session(id, manager)` directly, so the probe passes
+    `get()` and `locked()` before the DELETE wakes and then queues behind it.
+    The DELETE returns 204. The probe raises `404 "Unknown session"`, and the
+    engine session's `current_url()` isn't called. This ordering was executed in a
+    pure-`asyncio` model on Python 3.11.11: `['delete-ran', 'probe-404']`.
 13. **Two DELETEs queued on the lock close once.** Block an action so it holds
     the lock. Start two DELETEs of the same id, then release the action. Both
     return 204, `close()` is called once, and `sessions_deleted_total` is 1.
@@ -248,10 +271,12 @@ block on an `asyncio.Event`:
 
 ## Proof (before and after)
 
-- **Sandbox, part of the merge gate.** Tests 1, 2, 6 and 13 fail on `main`.
-  There, DELETE awaits the close, the second DELETE is a 404, and a cancel
-  mid-close skips the rest of the close. Two DELETEs queued on the lock both
-  close and both count on `main` too. Executed 15 Nov 2026 against `FakeEngine`
+- **Sandbox, part of the merge gate.** Tests 1, 2, 6, 12 and 13 fail on
+  `main`. There, DELETE awaits the close, the second DELETE is a 404, and a
+  cancel mid-close skips the rest of the close. An action queued behind a
+  DELETE runs its verb on `main`, which has no recheck, and `FakeEngineSession`
+  verbs don't check `closed`. Two DELETEs queued on the lock both close and
+  both count on `main` too. Executed 15 Nov 2026 against `FakeEngine`
   at `1571e6c`, whose `api/session_manager.py` is `main`'s, with the lock held
   as a stand-in for an action: `results [None, None] close calls 2
   deleted_total 2`.
