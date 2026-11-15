@@ -23,6 +23,11 @@ from api.engine.base import Engine, EngineSession, SessionOpts
 # burst of legitimate concurrent traffic — that case should still back-pressure (503).
 EVICT_RECENT_ACTIVITY_WINDOW_S = 5.0
 
+# At shutdown, close_all() waits at most this long for DELETE's background closes before
+# cancelling the stragglers. Leaves room inside docker's default 10 s stop grace period
+# for the live records and engine.close().
+SHUTDOWN_PENDING_CLOSE_WAIT_S = 5.0
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,10 +47,16 @@ class SessionGone(Exception):
 
 
 class SessionCapacityError(Exception):
-    """POST /v1/sessions at MAX_SESSIONS."""
+    """POST /v1/sessions at MAX_SESSIONS.
 
-    def __init__(self, max_sessions: int) -> None:
+    `held_by_pending_close` is True iff the cap was still reached, after create() waited,
+    only because a DELETE's background close had not finished. That slot frees in
+    seconds, so the route answers it with a short Retry-After.
+    """
+
+    def __init__(self, max_sessions: int, *, held_by_pending_close: bool = False) -> None:
         self.max_sessions = max_sessions
+        self.held_by_pending_close = held_by_pending_close
         super().__init__(
             f"Session capacity reached ({max_sessions} active). Retry shortly or DELETE an idle session."
         )
@@ -112,6 +123,12 @@ class SessionManager:
 
         self._records: dict[str, SessionRecord] = {}
         self._tombstones: "OrderedDict[str, int]" = OrderedDict()  # sid -> idle_timeout used
+        # Ids an explicit DELETE removed (bounded by tombstone_max, oldest evicted first): a
+        # repeat DELETE of one of them returns 204, so a client's retry is safe.
+        self._deleted: "OrderedDict[str, None]" = OrderedDict()
+        # DELETE's background closes. A pending close is still a running browser process,
+        # so it counts toward max_sessions until its task is done.
+        self._pending_closes: set[asyncio.Task[None]] = set()
 
         self.sessions_created_total = 0
         self.sessions_reaped_total = 0
@@ -150,6 +167,7 @@ class SessionManager:
             "browser_restarts_total": self.browser_restarts_total,
             "uptime_seconds": self.uptime_seconds(),
             "spare_ready": self._engine.spare_ready(),
+            "closes_pending": self._pending_count(),
         }
 
     async def engine_warm(self) -> None:
@@ -162,6 +180,77 @@ class SessionManager:
         self._tombstones.move_to_end(session_id)
         while len(self._tombstones) > self.tombstone_max:
             self._tombstones.popitem(last=False)
+
+    def _deleted_add(self, session_id: str) -> None:
+        self._deleted[session_id] = None
+        self._deleted.move_to_end(session_id)
+        while len(self._deleted) > self.tombstone_max:
+            self._deleted.popitem(last=False)
+
+    # ---- background closes -------------------------------------------------------
+
+    def _pending_count(self) -> int:
+        # `not task.done()`, so the count never depends on when the done-callback runs.
+        return sum(1 for task in self._pending_closes if not task.done())
+
+    def _cap_reached(self) -> bool:
+        return len(self._records) + self._pending_count() >= self.max_sessions
+
+    def _close_later(self, engine_session: EngineSession, session_id: str) -> None:
+        """Close a deleted session's engine session in a task on the loop.
+
+        The request doesn't await the task, so a client disconnect can't cancel it; only
+        close_all() at shutdown does. The set holds a strong reference until it is done.
+        """
+        task = asyncio.get_running_loop().create_task(
+            self._close_quietly(engine_session, session_id)
+        )
+        self._pending_closes.add(task)
+        task.add_done_callback(self._pending_closes.discard)
+
+    async def _close_quietly(self, engine_session: EngineSession, session_id: str) -> None:
+        try:
+            await engine_session.close()
+        except Exception:  # noqa: BLE001 - the record is already gone; log and end
+            # CancelledError isn't an Exception, so a cancel at shutdown still ends the task.
+            logger.warning("delete: close failed sid=%s", short(session_id), exc_info=True)
+
+    async def _make_room(self, deadline: float) -> bool:
+        """While the cap is reached and closes are pending, wait for one to finish.
+
+        Returns True iff the cap is still reached at the deadline with a close still
+        pending: the slot is held by a close, not a live session, so create() returns 503
+        and evicts nothing. Returns False once the cap isn't reached or no close is pending.
+        """
+        loop = asyncio.get_running_loop()
+        while self._cap_reached():
+            pending = {task for task in self._pending_closes if not task.done()}
+            if not pending:
+                return False
+            left = deadline - loop.time()
+            if left <= 0:
+                return True
+            await asyncio.wait(pending, timeout=left, return_when=asyncio.FIRST_COMPLETED)
+        return False
+
+    async def _claim_slot(self, deadline: float, fresh: EngineSession | None) -> str | None:
+        """One of create()'s capacity checks. Returns the evicted id, or None when nothing
+        was evicted; raises SessionCapacityError (closing `fresh` first, if given)."""
+        if not self._cap_reached():
+            return None
+        held_by_close = await self._make_room(deadline)
+        if not self._cap_reached():
+            return None
+        # A pending close is never a reason to evict a live session.
+        victim = None if held_by_close else self._oldest_evictable_idle()
+        if victim is None:
+            if fresh is not None:
+                with suppress(Exception):
+                    await fresh.close()
+            self.sessions_rejected_total += 1
+            raise SessionCapacityError(self.max_sessions, held_by_pending_close=held_by_close)
+        await self._evict_one(victim)
+        return victim.session_id
 
     # ---- lifecycle ---------------------------------------------------------------
 
@@ -211,37 +300,28 @@ class SessionManager:
         )
 
     async def create(
-        self, opts: SessionOpts, *, idle_timeout_seconds: int | None
+        self,
+        opts: SessionOpts,
+        *,
+        idle_timeout_seconds: int | None,
+        pending_close_wait_s: float = 0.0,
     ) -> CreateResult:
-        # The cap check + insert path has no `await` once we have an engine_session, so
-        # it is atomic under the single-threaded event loop. The pre-check fails fast OR
-        # evicts the oldest idle to free a slot; the post-check (after the engine await)
-        # catches a concurrent create that filled the cap during `new_session`.
-        evicted_id: str | None = None
-        if len(self._records) >= self.max_sessions:
-            victim = self._oldest_evictable_idle()
-            if victim is None:
-                self.sessions_rejected_total += 1
-                raise SessionCapacityError(self.max_sessions)
-            evicted_id = victim.session_id
-            await self._evict_one(victim)
+        # The cap counts live records plus DELETE's pending closes. The cap check + insert
+        # path has no `await` once a slot is claimed, so it is atomic under the
+        # single-threaded event loop. The pre-check waits (up to `pending_close_wait_s`,
+        # one deadline for both checks) for a pending close, then fails fast OR evicts the
+        # oldest idle; the post-check (after the engine await) catches a concurrent create
+        # that filled the cap during `new_session`.
+        deadline = asyncio.get_running_loop().time() + pending_close_wait_s
+        evicted_id = await self._claim_slot(deadline, None)
 
         engine_session = await self._engine.new_session(opts)
-        if len(self._records) >= self.max_sessions:
-            # Concurrent create filled the cap during our await. Try one more LRU pass
-            # — if a slot can still be freed without disturbing an active session, take
-            # it; otherwise 503 back-pressure.
-            victim = self._oldest_evictable_idle()
-            if victim is None:
-                with suppress(Exception):
-                    await engine_session.close()
-                self.sessions_rejected_total += 1
-                raise SessionCapacityError(self.max_sessions)
-            evicted_id = victim.session_id
-            await self._evict_one(victim)
+        evicted_late = await self._claim_slot(deadline, engine_session)
+        if evicted_late is not None:
+            evicted_id = evicted_late
 
         sid = uuid.uuid4().hex
-        while sid in self._records or sid in self._tombstones:  # documentation-grade
+        while sid in self._records or sid in self._tombstones or sid in self._deleted:
             sid = uuid.uuid4().hex
         now_wall = time.time()
         rec = SessionRecord(
@@ -273,20 +353,35 @@ class SessionManager:
         rec.last_used_at = time.time()
         rec.last_used_monotonic = self._clock()
 
+    def still_live(self, rec: SessionRecord) -> bool:
+        """Every path that acquires `rec.lock` calls this right after acquiring: a DELETE
+        or an eviction may have closed the session while the caller waited on the lock."""
+        return not rec.closing and self._records.get(rec.session_id) is rec
+
     async def delete(self, session_id: str, *, lock_acquire_timeout_s: float) -> None:
+        """Make the session unreachable and return; its engine session closes in the
+        background. Idempotent for ids this service deleted (the route returns 204)."""
+        if session_id in self._deleted:
+            return
         rec = self.get(session_id)  # raises SessionGone -> 404
         try:
             await asyncio.wait_for(rec.lock.acquire(), timeout=lock_acquire_timeout_s)
         except (asyncio.TimeoutError, TimeoutError):
             raise SessionBusy()
+        # Nothing from here to the end awaits, so a client disconnect can't interrupt it.
         try:
+            if not self.still_live(rec):
+                # A first DELETE of this id, an eviction, or the reaper (when this DELETE
+                # was woken just ahead of its acquire) closed it while we waited: 204, no
+                # second close, no counter change, and the id isn't added to _deleted.
+                return
             rec.closing = True
-            with suppress(Exception):
-                await rec.engine_session.close()
-        finally:
             self._records.pop(session_id, None)
+            self._deleted_add(session_id)
             self.sessions_deleted_total += 1
+        finally:
             rec.lock.release()
+        self._close_later(rec.engine_session, session_id)
 
     async def reap_pass(self) -> None:
         if not self._engine.is_alive():
@@ -322,7 +417,19 @@ class SessionManager:
                 logger.exception("reaper: failed to reap %s", short(sid))
                 continue
 
-    async def close_all(self) -> None:
+    async def close_all(
+        self, *, pending_close_wait_s: float = SHUTDOWN_PENDING_CLOSE_WAIT_S
+    ) -> None:
+        pending = set(self._pending_closes)
+        # asyncio.wait raises ValueError on an empty set, and lifespan suppresses that, so
+        # an unguarded call would skip the live records on every ordinary shutdown.
+        if pending:
+            _, stragglers = await asyncio.wait(pending, timeout=pending_close_wait_s)
+            for task in stragglers:
+                task.cancel()
+            if stragglers:
+                # None is still running when Playwright stops under it.
+                await asyncio.gather(*stragglers, return_exceptions=True)
         for rec in list(self._records.values()):
             with suppress(Exception):
                 await rec.engine_session.close()

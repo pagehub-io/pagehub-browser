@@ -23,6 +23,10 @@ router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
 
 _ERROR_RESPONSES = {404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}}
 
+# Retry-After on a create's 503 when the slot is held by a DELETE's pending close, which
+# frees in seconds, not by a live session (which the reaper frees, hence its interval).
+PENDING_CLOSE_RETRY_AFTER_S = 1
+
 
 def _iso(epoch_seconds: float) -> str:
     return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -54,9 +58,19 @@ async def create_session(
         user_agent=body.user_agent,
     )
     try:
-        result = await manager.create(opts, idle_timeout_seconds=body.idle_timeout_seconds)
+        result = await manager.create(
+            opts,
+            idle_timeout_seconds=body.idle_timeout_seconds,
+            # The same bound a DELETE waits on the lock.
+            pending_close_wait_s=settings.lock_acquire_timeout_ms / 1000,
+        )
     except SessionCapacityError as exc:
-        raise capacity_http(exc, settings.reaper_interval_seconds)
+        retry_after = (
+            PENDING_CLOSE_RETRY_AFTER_S
+            if exc.held_by_pending_close
+            else settings.reaper_interval_seconds
+        )
+        raise capacity_http(exc, retry_after)
     return serialize_session(
         result.record,
         current_url=result.record.current_url,
@@ -85,6 +99,10 @@ async def get_session(
     live_url = rec.current_url
     if not rec.lock.locked():
         async with rec.lock:
+            # The probe can queue: locked() is false right after a release, before the
+            # woken waiter (say a DELETE) runs. Recheck once we hold the lock.
+            if not manager.still_live(rec):
+                raise session_gone_http(SessionGone(session_id, expired=False))
             try:
                 live_url = await rec.engine_session.current_url()
             except Exception:  # noqa: BLE001 - status probe is best-effort
