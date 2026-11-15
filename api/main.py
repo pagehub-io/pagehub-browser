@@ -58,6 +58,8 @@ async def lifespan(app: FastAPI):
     manager = _build_manager(engine)
     app.state.engine = engine
     app.state.manager = manager
+    # Deliberate: start the spare launching now, before the reaper task's first tick.
+    await engine.warm()
     app.state.reaper_task = asyncio.create_task(reaper_loop(manager))
 
     try:

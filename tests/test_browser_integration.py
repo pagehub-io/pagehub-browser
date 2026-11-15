@@ -286,3 +286,31 @@ def test_pageerror_recorded_from_page_and_sandboxed_iframe_real(real_client):
     for needle in ("top-level-boom", "top-level-rejection", "frame-boom"):
         assert any(needle in t for t in texts), (needle, texts)
     c.delete(f"/v1/sessions/{sid}")
+
+
+@pytest.mark.asyncio
+async def test_create_takes_warm_spare_without_a_new_launch():
+    """#20: once the spare is ready, a create takes it and launches no new Chromium."""
+    import asyncio
+    import time
+    from unittest import mock
+
+    from api.engine.base import SessionOpts
+    from api.engine.playwright_engine import PlaywrightEngine
+
+    engine = PlaywrightEngine()
+    try:
+        await engine.warm()
+        deadline = time.monotonic() + 30
+        while not engine.spare_ready() and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        assert engine.spare_ready(), "the spare never became ready"
+
+        with mock.patch.object(
+            engine._pw.chromium, "launch", wraps=engine._pw.chromium.launch
+        ) as launch_spy:
+            session = await engine.new_session(SessionOpts())
+            assert launch_spy.call_count == 0
+        await session.close()
+    finally:
+        await engine.close()

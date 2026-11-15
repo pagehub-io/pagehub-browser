@@ -136,7 +136,7 @@ class SessionManager:
     def uptime_seconds(self) -> int:
         return int(self._clock() - self.started_at_monotonic)
 
-    def metrics_snapshot(self) -> dict[str, int]:
+    def metrics_snapshot(self) -> dict[str, int | bool]:
         return {
             "live_sessions": self.live_sessions,
             "max_sessions": self.max_sessions,
@@ -149,7 +149,11 @@ class SessionManager:
             "action_errors_total": self.action_errors_total,
             "browser_restarts_total": self.browser_restarts_total,
             "uptime_seconds": self.uptime_seconds(),
+            "spare_ready": self._engine.spare_ready(),
         }
+
+    async def engine_warm(self) -> None:
+        await self._engine.warm()
 
     # ---- tombstones --------------------------------------------------------------
 
@@ -333,4 +337,11 @@ async def reaper_loop(manager: SessionManager) -> None:
             raise
         except Exception:  # noqa: BLE001 - a bad tick must not kill the reaper
             logger.exception("reaper tick failed")
+        # Refill and recycle the spare in its own try: a failed reap pass still warms.
+        try:
+            await manager.engine_warm()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a bad warm must not kill the reaper
+            logger.exception("spare warm tick failed")
         await asyncio.sleep(manager.reaper_interval)
