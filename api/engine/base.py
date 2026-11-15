@@ -173,6 +173,13 @@ class Engine(abc.ABC):
     @abc.abstractmethod
     async def new_session(self, opts: SessionOpts) -> EngineSession: ...
 
+    async def warm(self) -> None:
+        """Keep any pre-launched browser ready. Default no-op for engines without a spare."""
+
+    def spare_ready(self) -> bool:
+        """True iff a pre-launched spare browser is ready to be taken. Default: no spare."""
+        return False
+
     @abc.abstractmethod
     def is_alive(self) -> bool:
         """True iff the engine can serve session creates.

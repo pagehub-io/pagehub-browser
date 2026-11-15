@@ -671,6 +671,12 @@ class PlaywrightEngine(Engine):
         self._pw: Playwright | None = None
         self._browser_restarts_total = 0
         self._launch_lock = asyncio.Lock()
+        # One pre-launched Chromium handed to the next create, so a create does not pay a
+        # cold launch. It is never returned once taken, preserving per-session isolation.
+        self._spare: Browser | None = None
+        self._spare_born: float = 0.0
+        self._refill_task: asyncio.Task[None] | None = None
+        self._closing = False
         # Per-session browsers we are closing on purpose (session close / failed
         # create), so `_on_disconnected` counts only UNEXPECTED crashes (review I-1). A
         # WeakSet auto-drops a browser once it is GC'd — no stale entry if a browser
@@ -705,22 +711,39 @@ class PlaywrightEngine(Engine):
         # ONE dedicated chromium process per session (not a context on a shared
         # browser). Memory is fully reclaimed when the session closes, and a crash is
         # isolated to that session — the shared-browser model accumulated memory across
-        # contexts and, on an OOM-disconnect, killed every live session at once.
+        # contexts and, on an OOM-disconnect, killed every live session at once. A create
+        # takes the pre-launched spare when one is ready, and otherwise launches inline.
         browser: Browser | None = None
         owned = False  # flips True once the browser is handed to the returned session
         try:
+            # Read-and-clear with no await between: two concurrent creates can never take
+            # the same spare. A spare that is no longer connected is dropped as absent.
+            browser, self._spare = self._spare, None
+            if browser is not None and not browser.is_connected():
+                self._note_intentional_close(browser)
+                try:
+                    await browser.close()
+                except PlaywrightError:
+                    pass
+                browser = None
+            if browser is not None:
+                try:
+                    session = await self._open_session(browser, opts, attach=False)
+                except PlaywrightError:
+                    # A taken spare that fails before ownership passes to the session is
+                    # reaped and the create falls back ONCE to an inline launch.
+                    self._note_intentional_close(browser)
+                    try:
+                        await browser.close()
+                    except PlaywrightError:
+                        pass
+                    browser = None
+                else:
+                    owned = True
+                    return session
             pw = await self._ensure_pw()
             browser = await pw.chromium.launch(headless=settings.headless, args=_CHROMIUM_ARGS)
-            browser.on("disconnected", self._on_disconnected)
-            context_kwargs: dict[str, Any] = {
-                "viewport": {"width": opts.viewport_width, "height": opts.viewport_height},
-            }
-            if opts.user_agent:
-                context_kwargs["user_agent"] = opts.user_agent
-            context = await browser.new_context(**context_kwargs)
-            page = await context.new_page()
-            session = PlaywrightEngineSession(self, browser, context, page)
-            await context.route("**/*", session._navigation_interceptor)
+            session = await self._open_session(browser, opts, attach=True)
             owned = True
             return session
         except PlaywrightError as exc:
@@ -740,6 +763,115 @@ class PlaywrightEngine(Engine):
                     await browser.close()
                 except PlaywrightError:
                     pass
+            self._schedule_refill()
+
+    async def _open_session(
+        self, browser: Browser, opts: SessionOpts, *, attach: bool
+    ) -> PlaywrightEngineSession:
+        """Build one session on ``browser``. A spare already has its disconnect listener."""
+        if attach:
+            browser.on("disconnected", self._on_disconnected)
+        context_kwargs: dict[str, Any] = {
+            "viewport": {"width": opts.viewport_width, "height": opts.viewport_height},
+        }
+        if opts.user_agent:
+            context_kwargs["user_agent"] = opts.user_agent
+        context = await browser.new_context(**context_kwargs)
+        page = await context.new_page()
+        session = PlaywrightEngineSession(self, browser, context, page)
+        await context.route("**/*", session._navigation_interceptor)
+        return session
+
+    def _schedule_refill(self, replace: bool = False) -> None:
+        """Start a spare refill unless one is running, a spare is ready, or we're closing."""
+        if self._refill_task is not None and not self._refill_task.done():
+            return
+        if not replace and self._spare is not None:
+            return
+        if self._closing:
+            return
+        if not settings.browser_spare:
+            return
+        self._refill_task = asyncio.create_task(self._refill(replace))
+
+    async def _refill(self, replace: bool = False) -> None:
+        """Launch and warm a replacement spare. Never retries: the next create or warm does."""
+        browser: Browser | None = None
+        stored = False
+        try:
+            pw = await self._ensure_pw()
+            browser = await pw.chromium.launch(headless=settings.headless, args=_CHROMIUM_ARGS)
+            browser.on("disconnected", self._on_disconnected)
+            # Warm the launch + renderer path a create's first new_context/new_page needs,
+            # then close the context so the spare holds no cookie or storage.
+            context: BrowserContext | None = None
+            try:
+                context = await browser.new_context()
+                await context.new_page()
+            finally:
+                if context is not None:
+                    try:
+                        await context.close()
+                    except PlaywrightError:
+                        pass
+            if self._closing:
+                self._note_intentional_close(browser)
+                try:
+                    await browser.close()
+                except PlaywrightError:
+                    pass
+                return
+            old, self._spare = self._spare, browser
+            self._spare_born = time.monotonic()
+            stored = True
+            if old is not None:
+                self._note_intentional_close(old)
+                try:
+                    await old.close()
+                except PlaywrightError:
+                    pass
+        except asyncio.CancelledError:
+            # Mark before closing so the teardown isn't counted as a crash.
+            if browser is not None and not stored:
+                self._note_intentional_close(browser)
+                try:
+                    await browser.close()
+                except PlaywrightError:
+                    pass
+            raise
+        except Exception:  # noqa: BLE001 - a failed refill must never escape or retry
+            logger.warning("spare chromium launch failed", exc_info=True)
+            # Mark before closing so a failed warm-up isn't counted as a crash.
+            if browser is not None and not stored:
+                self._note_intentional_close(browser)
+                try:
+                    await browser.close()
+                except PlaywrightError:
+                    pass
+
+    async def warm(self) -> None:
+        """Keep the spare ready and recycle it once it is older than its max age."""
+        try:
+            if not settings.browser_spare:
+                return
+            if self._spare is not None and not self._spare.is_connected():
+                dead, self._spare = self._spare, None
+                self._note_intentional_close(dead)
+                try:
+                    await dead.close()
+                except PlaywrightError:
+                    pass
+            self._schedule_refill()
+            if (
+                self._spare is not None
+                and time.monotonic() - self._spare_born > settings.browser_spare_max_age_seconds
+            ):
+                self._schedule_refill(replace=True)
+        except Exception:  # noqa: BLE001 - warm is best-effort and must never raise
+            logger.warning("spare chromium warm failed", exc_info=True)
+
+    def spare_ready(self) -> bool:
+        return self._spare is not None and self._spare.is_connected()
 
     def is_alive(self) -> bool:
         # The engine can serve while Playwright is running; sessions own their own
@@ -751,8 +883,23 @@ class PlaywrightEngine(Engine):
 
     async def close(self) -> None:
         # Engine teardown. Per-session browsers are owned by their sessions (closed on
-        # session close, or with the process on shutdown); stopping Playwright is the
-        # only engine-level teardown left.
+        # session close, or with the process on shutdown); the spare and any in-flight
+        # refill are engine-level and reaped here, then Playwright is stopped.
+        self._closing = True
+        task = self._refill_task
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        browser, self._spare = self._spare, None
+        if browser is not None:
+            self._note_intentional_close(browser)
+            try:
+                await browser.close()
+            except PlaywrightError:
+                pass
         try:
             if self._pw is not None:
                 await self._pw.stop()

@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     default_viewport_height: int = 720
     headless: bool = True
 
+    # One pre-launched Chromium (the spare) that the next session create takes instead of
+    # paying a cold launch. False restores the exact pre-spare behaviour.
+    browser_spare: bool = True
+    browser_spare_max_age_seconds: int = 300
+
     action_timeout_max_ms: int = 110000
     modal_function_timeout_ms: int = 120000
     lock_acquire_timeout_ms: int = 5000

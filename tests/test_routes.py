@@ -514,8 +514,10 @@ def test_metrics_full_field_set_and_counters(client):
         "live_sessions", "max_sessions", "sessions_created_total", "sessions_reaped_total",
         "sessions_deleted_total", "sessions_rejected_total", "sessions_lru_evicted_total",
         "actions_total", "action_errors_total", "browser_restarts_total", "uptime_seconds",
+        "spare_ready",
     }
     assert set(body.keys()) == expected_fields
+    assert body["spare_ready"] is False
 
     sid = _create(client)
     assert client.get("/metrics").json()["sessions_created_total"] == 1
