@@ -110,6 +110,7 @@ class MetricsResponse(BaseModel):
     browser_restarts_total: int
     uptime_seconds: int
     spare_ready: bool
+    closes_pending: int
 
 
 class ErrorResponse(BaseModel):

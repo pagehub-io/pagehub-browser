@@ -96,6 +96,12 @@ async def _run_action(
     except (asyncio.TimeoutError, TimeoutError):
         raise session_busy_http(SessionBusy())
 
+    # A DELETE or an eviction may have closed the session while this request waited on
+    # the lock. Raise the mapped 404: no global handler maps a bare SessionGone.
+    if not manager.still_live(rec):
+        rec.lock.release()
+        raise session_gone_http(SessionGone(session_id, expired=False))
+
     manager.actions_total += 1
     host_suffix = f" host={log_host}" if log_host else ""
     started = time.monotonic()

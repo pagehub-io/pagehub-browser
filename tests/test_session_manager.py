@@ -41,10 +41,15 @@ async def test_create_up_to_cap_then_capacity_error_when_all_active():
     assert mgr.sessions_rejected_total == 1
     assert mgr.sessions_lru_evicted_total == 0
     # After explicit delete one slot is free -> the next create succeeds without eviction.
+    # The deleted session's close is still pending when this create reaches the cap, so it
+    # passes only through _make_room's wait for that close.
     await mgr.delete(results[0].record.session_id, lock_acquire_timeout_s=1)
-    r = await mgr.create(OPTS, idle_timeout_seconds=None)
+    r = await mgr.create(OPTS, idle_timeout_seconds=None, pending_close_wait_s=1)
     assert r.evicted_session_id is None
     assert mgr.sessions_created_total == 4
+    assert results[0].record.engine_session.close_calls == 1
+    assert results[0].record.engine_session.closed is True
+    assert mgr.metrics_snapshot()["closes_pending"] == 0
 
 
 async def test_create_concurrent_at_cap_never_overshoots():
@@ -85,9 +90,8 @@ async def test_double_delete():
     mgr = _mgr(engine, clock)
     rec = (await mgr.create(OPTS, idle_timeout_seconds=None)).record
     await mgr.delete(rec.session_id, lock_acquire_timeout_s=1)
-    with pytest.raises(SessionGone) as ei:
-        await mgr.delete(rec.session_id, lock_acquire_timeout_s=1)
-    assert ei.value.expired is False
+    # The second delete() returns without raising (the route answers 204).
+    await mgr.delete(rec.session_id, lock_acquire_timeout_s=1)
     assert mgr.sessions_deleted_total == 1
 
 

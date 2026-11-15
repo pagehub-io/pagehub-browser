@@ -134,7 +134,10 @@ for that instead of failing or evicting a bystander:
   2. If the cap isn't reached, `create()` goes on.
   3. If it's still reached and closes are still pending, the slot is held
      by a close, not by a live session. `create()` returns 503 with
-     `Retry-After` and evicts nothing.
+     `Retry-After: 1` and evicts nothing. A close frees its slot in seconds,
+     so this 503 doesn't carry the cap 503's `reaper_interval_seconds` (30 s):
+     `SessionCapacityError.held_by_pending_close` tells the route which one
+     it is.
   4. If it's still reached and no close is pending, the live records alone
      fill the cap. `create()` evicts the oldest idle session through
      `_evict_one` or returns 503, as today.
@@ -159,11 +162,14 @@ closes its fresh engine session before the 503 as today.
   the generic unknown-404, because it doesn't consult `_deleted`. A
   never-existed id still gets 404 on DELETE. A reaped id still gets the
   expired-404 on DELETE and every other route.
-- **A DELETE queued behind the reaper or an eviction** finds the record
-  closing at step 1's recheck and returns 204. The session is going away
-  either way. Its id isn't added to `_deleted`, so a later DELETE of it gets
-  what the reaper or eviction leaves (the expired-404 for a reaped id, the
-  generic 404 for an evicted one).
+- **A DELETE queued behind the reaper** gets the 409 at the lock timeout, as
+  today: the reaper holds `rec.lock` and never releases it (see "Every lock
+  holder rechecks"). **A DELETE queued behind an eviction, or woken just
+  ahead of the reaper's acquire,** finds the record closing at step 1's
+  recheck and returns 204. The session is going away either way. Its id
+  isn't added to `_deleted`, so a later DELETE of it gets what the reaper or
+  eviction leaves (the expired-404 for a reaped id, the generic 404 for an
+  evicted one).
 - **This reverses one documented decision.** SPEC.md "Double `DELETE`" chose
   404 on a second DELETE so authors could tell "I deleted something" from
   "there was nothing there". A client's retry of a timed-out DELETE can't be
@@ -200,7 +206,7 @@ closes its fresh engine session before the 503 as today.
 | The client disconnects after the pop | The close task is on the loop and isn't cancelled. The process closes. |
 | The close raises or the process is already dead | A warning is logged and the task ends. The record is already gone. |
 | A create at the cap right after a DELETE | It waits up to 5 s for a pending close to finish, then creates. It doesn't evict another client's idle session for a slot a close holds. |
-| Many DELETEs under heavy load | Pending closes pile up and count toward `max_sessions`. A create waits up to 5 s for one to finish, then gets 503 with `Retry-After`, and no live session is evicted for them. `closes_pending` shows it. |
+| Many DELETEs under heavy load | Pending closes pile up and count toward `max_sessions`. A create waits up to 5 s for one to finish, then gets 503 with `Retry-After: 1`, and no live session is evicted for them. `closes_pending` shows it. |
 | Shutdown with closes pending | `close_all` waits up to 5 s for them, then cancels the rest and awaits them, then closes the live records. Any process a cancelled close leaves dies with the container. |
 | More than 256 deletes since an id was deleted | That id drops out of `_deleted`, and a very late retry gets 404 as today. A retry comes within seconds, so 256 is plenty. |
 
@@ -222,7 +228,9 @@ block on an `asyncio.Event`:
 7. `create()` counts pending closes: with `max_sessions = 1` and one pending
    close that stays blocked, create waits out `pending_close_wait_s` (short,
    injected) and raises `SessionCapacityError`. With the close released inside
-   the bound, create succeeds.
+   the bound, create succeeds. Through the route, that 503 carries
+   `Retry-After: 1`, and a cap held by a live session keeps
+   `Retry-After: <reaper_interval_seconds>`.
 8. `close_all()` awaits pending closes. When a close never finishes, it
    returns after the bound (short, injected for the test), and the straggler
    task has been cancelled and is done before the live records are closed.
@@ -268,6 +276,11 @@ block on an `asyncio.Event`:
     the bystander is still live, and `sessions_lru_evicted_total` is 0. Then,
     with the close never released and a short `pending_close_wait_s`, the
     create raises `SessionCapacityError` and the bystander is still live.
+15. **A DELETE queued behind the reaper or an eviction.** One that passed
+    `get()` before the reaper took the lock gets 409 at the lock timeout. One
+    woken just ahead of the reaper's acquire, and one queued behind an
+    eviction, each return 204 with no close of their own and no count, and
+    a later DELETE of the id gets the expired-404 or the generic 404.
 
 ## Proof (before and after)
 

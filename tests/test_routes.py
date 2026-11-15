@@ -61,11 +61,16 @@ def test_list_empty(client):
     assert r.json() == {"count": 0, "sessions": []}
 
 
-def test_delete_204_then_404(client):
+def test_delete_twice_204(client):
+    """A repeat DELETE of an id this service deleted is 204 (a client retry is safe);
+    every other route on it is still the generic unknown-404."""
     sid = _create(client)
     r = client.request("DELETE", f"/v1/sessions/{sid}")
     assert r.status_code == 204
     r = client.request("DELETE", f"/v1/sessions/{sid}")
+    assert r.status_code == 204
+    assert client.app.state.manager.sessions_deleted_total == 1
+    r = client.get(f"/v1/sessions/{sid}")
     assert r.status_code == 404
     assert "Unknown session" in r.json()["detail"]
 
@@ -514,10 +519,11 @@ def test_metrics_full_field_set_and_counters(client):
         "live_sessions", "max_sessions", "sessions_created_total", "sessions_reaped_total",
         "sessions_deleted_total", "sessions_rejected_total", "sessions_lru_evicted_total",
         "actions_total", "action_errors_total", "browser_restarts_total", "uptime_seconds",
-        "spare_ready",
+        "spare_ready", "closes_pending",
     }
     assert set(body.keys()) == expected_fields
     assert body["spare_ready"] is False
+    assert body["closes_pending"] == 0
 
     sid = _create(client)
     assert client.get("/metrics").json()["sessions_created_total"] == 1

@@ -32,6 +32,10 @@ class FakeClock:
 class FakeEngineSession(EngineSession):
     def __init__(self) -> None:
         self.closed = False
+        self.close_calls = 0
+        self.current_url_calls = 0
+        # Every verb that reached _gate, in call order.
+        self.calls: list[str] = []
         self.navigate_calls: list[tuple[str, str, int]] = []
         self._url: str | None = None
         self._console: list[ConsoleLogEntry] = [ConsoleLogEntry(type="log", text="fake-console")]
@@ -51,6 +55,7 @@ class FakeEngineSession(EngineSession):
         self.navigate_title = "Example Domain"
 
     async def _gate(self, verb: str) -> None:
+        self.calls.append(verb)
         ev = self.block_on.get(verb)
         if ev is not None:
             await ev.wait()
@@ -185,9 +190,14 @@ class FakeEngineSession(EngineSession):
         return "ok"
 
     async def current_url(self) -> str | None:
+        self.current_url_calls += 1
         return self._url
 
     async def close(self) -> None:
+        self.close_calls += 1
+        ev = self.block_on.get("close")
+        if ev is not None:
+            await ev.wait()
         if "close" in self.raise_on:
             raise self.raise_on["close"]
         self.closed = True
