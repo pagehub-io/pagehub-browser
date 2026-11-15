@@ -60,22 +60,32 @@ The engine gets three new pieces of state:
      attached, then `new_context`, `new_page` and the route. So is the
      `finally` that reaps a browser not handed to a session.
    - Before returning or raising, `new_session` calls `_schedule_refill()`.
-2. **`_schedule_refill()`** starts `_refill_task = asyncio.create_task(self._refill())`
-   unless one of these holds:
+2. **`_schedule_refill(replace=False)`** starts
+   `_refill_task = asyncio.create_task(self._refill(replace))` unless one of
+   these holds:
    - a refill task is already running;
-   - a spare is ready;
+   - a spare is ready and `replace` is false;
    - the engine is closing;
    - `settings.browser_spare` is false.
 
    It never awaits, so a create never waits on the refill.
 3. **`_refill()`** launches the replacement:
    - It calls `_ensure_pw()`, launches with the same `headless` and
-     `_CHROMIUM_ARGS`, attaches `on("disconnected", self._on_disconnected)`,
-     then stores the browser as `_spare` and sets `_spare_born`.
+     `_CHROMIUM_ARGS`, and attaches `on("disconnected", self._on_disconnected)`.
+   - It then warms the new browser: it opens a context and an `about:blank`
+     page, then closes the context. This reads the renderer files a create's
+     first `new_context` plus `new_page` needs (2.66 s cold, above). The
+     closed context leaves no cookie or storage behind.
+   - Only then does it store the browser as `_spare` and set `_spare_born`.
+     It stores it with no `await` in between:
+     `old, self._spare = self._spare, browser`. If `old` is set (a recycle,
+     below), it marks `old` intentional and closes it, errors ignored.
    - If the engine started closing while the launch was in flight, it marks
      the new browser intentional and closes it instead of storing it.
-   - On any exception other than `CancelledError`, it logs a warning
-     ("spare chromium launch failed"), leaves `_spare` as `None` and returns.
+   - On any exception other than `CancelledError`, in the launch or the
+     warm-up, it logs a warning ("spare chromium launch failed"), closes a
+     launched browser with errors ignored, leaves `_spare` unchanged and
+     returns. A failed warm-up is a failed refill.
      There is no retry loop: the next create launches inline and schedules
      another refill.
    - On `CancelledError`, it closes a browser that was launched but not yet
@@ -84,16 +94,26 @@ The engine gets three new pieces of state:
    `FakeEngine` and any future engine are unaffected:
    - In `PlaywrightEngine` it calls `_schedule_refill()`, and recycles the
      spare when it is older than `settings.browser_spare_max_age_seconds`.
-   - To recycle, it takes the spare the same atomic way, marks it intentional,
-     closes it, then calls `_schedule_refill()`.
+   - To recycle, it calls `_schedule_refill(replace=True)`. The old spare stays
+     in `_spare` until the new one is launched and warmed, and `_refill` then
+     swaps them and closes the old one. A create during the recycle still
+     takes the old spare, so there is no window where it must launch inline.
+     If a create took the old spare first, the swap finds `None` and just
+     stores the new one.
    - `warm()` is cheap and never raises: exceptions are logged and swallowed.
 5. **Recycling keeps the spare warm.** A spare that has sat for two hours may
    itself have gone cold. Its files can drop out of the page cache, so its
    first `new_context` plus `new_page` could cost seconds, like the 2.66 s
-   above. Relaunching it every `browser_spare_max_age_seconds` (default 300)
-   keeps Chromium's files hot. The cost is one launch every 5 minutes, about
-   0.1 s of work when warm. 300 s was chosen because the evidence shows no
-   slow create within a few minutes of the last one.
+   above. Relaunching and re-warming it every `browser_spare_max_age_seconds`
+   (default 300) keeps Chromium's files hot, both the launch path and the
+   context and page path. The cost is one launch and one blank page every
+   5 minutes, about 0.1 s of work when warm. 300 s was chosen because the
+   evidence shows no slow create within a few minutes of the last one.
+   - **This premise is reasoned-not-executed.** That a 5-minute launch plus a
+     blank page keeps those files cached through a 1 to 2 hour idle gap
+     depends on hoss's page cache under its real load. It can't be shown in a
+     sandbox, and this spec's review may not start Chromium. Its test is the
+     hoss check in "Proof". If that check fails, the fallback there applies.
 6. **`_on_disconnected` is unchanged.** A spare that crashes is an
    unexpected disconnect and counts in `browser_restarts_total`, as it should.
    `new_session` and `warm()` drop a disconnected spare the next time they
@@ -109,8 +129,9 @@ The engine gets three new pieces of state:
 ### Wiring
 
 - **The reaper loop** (`reaper_loop` in `api/session_manager.py`) calls
-  `await manager.engine_warm()` once per tick, after `reap_pass()`, inside the
-  same `try`. `SessionManager.engine_warm()` delegates to `self._engine.warm()`.
+  `await manager.engine_warm()` once per tick, after `reap_pass()`, in its own
+  `try`. A tick where `reap_pass()` raises still refills and recycles the
+  spare. `SessionManager.engine_warm()` delegates to `self._engine.warm()`.
   The reaper already ticks every `reaper_interval_seconds` (30), so a spare
   older than its max age is recycled within 30 s of its deadline. A crashed
   or failed spare is refilled within 30 s, even with no create.
@@ -121,6 +142,8 @@ The engine gets three new pieces of state:
 - **`/metrics`** gains `spare_ready: bool`, from `engine.spare_ready()`
   through `metrics_snapshot()`, so an eval or operator can see the spare.
   `MetricsResponse` gets the field, and `/health` is unchanged.
+  `metrics_snapshot()` is typed `dict[str, int]` today. Its type widens to
+  `dict[str, int | bool]`.
 - **Settings** (`api/config.py`, documented in `.env.example`):
   - `browser_spare: bool = True` (`BROWSER_SPARE`). False restores today's
     behaviour exactly: no spare, and `warm()` does nothing.
@@ -130,20 +153,20 @@ The engine gets three new pieces of state:
 
 - **`max_sessions`** counts sessions, not the spare. One spare is at most one
   extra Chromium (about 100 to 150 MB idle) on top of `max_sessions`. The
-  container has no memory limit in `docker-compose.yml`. Modal sizing
-  (SPEC "Risks") gains one browser of headroom.
+  container has no memory limit in `docker-compose.yml`. SPEC.md "Risks" is
+  amended in this PR to size memory for `(max_sessions + 1)` browsers.
 - **No status code, body or locator behaviour changes,** and `SessionOpts`
   still applies per context: viewport and user agent are context options, so
   a spare launched before the request needs nothing from it.
 - **Session isolation.** A spare holds no context, page, cookie or storage
-  before it is taken. Once taken, it belongs to one session and is closed with
+  before it is taken. Its warm-up context is closed before it is stored. Once taken, it belongs to one session and is closed with
   it. Nothing ever returns a browser to `_spare`.
 
 ## Failure modes
 
 | Case | What happens |
 |---|---|
-| The spare launch fails (OOM, missing binary) | A warning is logged and `_spare` stays `None`. Creates launch inline as today. The next reaper tick or create tries again, at most once per tick. |
+| The spare launch or warm-up fails (OOM, missing binary) | A warning is logged and `_spare` stays `None`. Creates launch inline as today. There is at most one refill in flight, started by the next create or reaper tick. |
 | The spare crashes while idle | `browser_restarts_total` +1. The next `new_session` or `warm()` sees `is_connected()` false, drops it and refills. |
 | Two creates arrive at once | One takes the spare. The other launches inline (today's cost) and the refill is scheduled once. |
 | The client disconnects mid-create | Unchanged: the `finally` reaps a browser not handed to a session, whether it was the spare or a fresh launch. A refill was already scheduled. |
@@ -163,12 +186,20 @@ small fake `Browser` that records `close()` and `is_connected()`:
    other launches, and only one refill task starts.
 4. A disconnected spare is closed and skipped: the create launches inline.
 5. A refill failure is logged, leaves `_spare` `None`, and doesn't raise into
-   the create. The next `warm()` schedules a new refill.
-6. `warm()` recycles a spare older than its max age: the old one is closed as
+   the create. The next `warm()` schedules a new refill. A failure in the
+   warm-up's `new_context` or `new_page` counts the same way, and the
+   launched browser is closed.
+6. `warm()` recycles a spare older than its max age: the new one is launched
+   and stored before the old one is closed, the old one is closed as
    intentional, and `browser_restarts_total` doesn't move.
-7. `close()` during an in-flight refill leaves no unclosed browser.
-8. `BROWSER_SPARE=false`: `warm()` and `new_session` never create a spare.
-9. `/metrics` returns `spare_ready` (FakeEngine: `false`).
+7. The stored spare has been warmed: a context was opened on it and closed,
+   and `browser.contexts` is empty when it is stored.
+8. `close()` during an in-flight refill leaves no unclosed browser.
+9. `BROWSER_SPARE=false`: `warm()` and `new_session` never create a spare.
+10. `/metrics` returns `spare_ready` (FakeEngine: `false`). The exact-field-set
+    test, `tests/test_routes.py::test_metrics_full_field_set_and_counters`,
+    gains the key.
+11. A tick where `reap_pass()` raises still calls `engine_warm()`.
 
 The existing browser integration test (`tests/test_browser_integration.py`,
 run in the Docker image) gains one case. It boots the engine, waits until
@@ -178,14 +209,18 @@ run in the Docker image) gains one case. It boots the engine, waits until
 ## Proof (before and after)
 
 - **Sandbox, part of the merge gate.**
-  - Tests 1 and 6 fail on `main`: there `new_session` always launches, and
-    no `warm()` or `spare_ready` exists.
-  - They pass on the branch.
+  - Tests 1 and 4 are the before/after proof. Each sets `engine._spare`
+    directly, so on `main` each fails on behaviour. There `new_session`
+    ignores `_spare`: test 1 sees a launch, and test 4 sees the dead spare
+    left unclosed.
+  - They pass on the branch. Test 6 is a regression test only, since on
+    `main` it fails just because `warm()` doesn't exist.
 - **On hoss, after deploy.**
   - The operator (the github session) rebuilds and restarts the shared
     `pagehub-browser` container. No lead does that.
-  - Then time the first create after at least 15 minutes of no sessions,
-    under the box's usual load.
+  - Then time the first create after at least 60 minutes of no sessions,
+    under the box's usual load. The retried creates in #20 came after 78
+    and 128 min idle, so a shorter gap wouldn't test the hard case.
   - **Pass:** under 2 s, and `/metrics` shows `spare_ready: true` before it.
   - Then the next RA or Give Happy eval run that would have retried shows
     every launch step at attempts 1.
